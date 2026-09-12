@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+import argparse
+import configparser
+import datetime
+import json
+import os
+import sys
+import tempfile
+
+CONFIG_FILE = "/etc/castillo-player/castillo.ini"
+
+
+def fail(message, code=1):
+    print(json.dumps(
+        {"ok": False, "error": message},
+        ensure_ascii=False
+    ), file=sys.stderr)
+    sys.exit(code)
+
+
+def clean_ini_value(value):
+    value = str(value).strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        value = value[1:-1].strip()
+
+    return value
+
+
+def config_boolean(value):
+    value = clean_ini_value(
+        value
+    ).casefold()
+
+    if value in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+
+    if value in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+
+    fail(
+        "Valor inválido para nas.enabled.",
+        4,
+    )
+
+
+def validate_config_file():
+    if not os.path.isfile(
+        CONFIG_FILE
+    ):
+        fail(
+            "No existe la configuración de Castillo Player.",
+            2,
+        )
+
+    try:
+        stat_info = os.stat(
+            CONFIG_FILE
+        )
+
+    except OSError as error:
+        fail(
+            f"No fue posible revisar la configuración: {error}",
+            2,
+        )
+
+    if stat_info.st_uid != 0:
+        fail(
+            "La configuración de Castillo Player debe pertenecer a root.",
+            2,
+        )
+
+    if stat_info.st_mode & 0o022:
+        fail(
+            "La configuración de Castillo Player no puede ser escribible "
+            "por grupo u otros usuarios.",
+            2,
+        )
+
+
+def load_castillo_config():
+    validate_config_file()
+
+    parser = configparser.ConfigParser(
+        interpolation=None
+    )
+
+    try:
+        loaded = parser.read(
+            CONFIG_FILE,
+            encoding="utf-8",
+        )
+
+    except (
+        configparser.Error,
+        OSError,
+    ) as error:
+        fail(
+            f"No fue posible leer la configuración: {error}",
+            3,
+        )
+
+    if not loaded:
+        fail(
+            "No fue posible cargar la configuración de Castillo Player.",
+            3,
+        )
+
+    try:
+        local_root = clean_ini_value(
+            parser["core"]["library_root"]
+        )
+
+        state_dir = clean_ini_value(
+            parser["core"]["state_dir"]
+        )
+
+        nas_enabled = config_boolean(
+            parser["nas"]["enabled"]
+        )
+
+        nas_root = clean_ini_value(
+            parser["nas"]["readonly_root"]
+        )
+
+    except KeyError as error:
+        fail(
+            f"Falta configuración requerida: {error}",
+            4,
+        )
+
+    if not nas_enabled:
+        fail(
+            "El módulo NAS está deshabilitado.",
+            5,
+        )
+
+    for name, value in (
+        ("library_root", local_root),
+        ("state_dir", state_dir),
+        ("nas.readonly_root", nas_root),
+    ):
+        if (
+            not value
+            or not os.path.isabs(
+                value
+            )
+        ):
+            fail(
+                f"{name} debe ser una ruta absoluta.",
+                6,
+            )
+
+    local_root = os.path.realpath(
+        local_root
+    )
+
+    state_dir = os.path.realpath(
+        state_dir
+    )
+
+    nas_root = os.path.realpath(
+        nas_root
+    )
+
+    if local_root == os.path.sep:
+        fail(
+            "library_root no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if state_dir == os.path.sep:
+        fail(
+            "state_dir no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if nas_root == os.path.sep:
+        fail(
+            "nas.readonly_root no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if not os.path.isdir(
+        local_root
+    ):
+        fail(
+            "No existe la biblioteca local configurada.",
+            8,
+        )
+
+    state_file = os.path.join(
+        state_dir,
+        "pending-changes.json",
+    )
+
+    return (
+        local_root,
+        nas_root,
+        state_file,
+    )
+
+
+def path_inside_root(
+    path,
+    root,
+):
+    try:
+        return (
+            os.path.commonpath(
+                [
+                    path,
+                    root,
+                ]
+            )
+            == root
+        )
+
+    except ValueError:
+        return False
+
+
+LOCAL_ROOT, NAS_ROOT, STATE_FILE = (
+    load_castillo_config()
+)
+
+
+def now_iso():
+    return datetime.datetime.now(
+        datetime.timezone.utc
+    ).isoformat()
+
+
+def file_info(path):
+    stat = os.stat(path)
+    return {
+        "size": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+    }
+
+
+def resolve_local(path):
+    real = os.path.realpath(path)
+
+    if (
+        not os.path.isfile(real)
+        or real == LOCAL_ROOT
+        or not path_inside_root(
+            real,
+            LOCAL_ROOT,
+        )
+    ):
+        fail(
+            "Archivo local no autorizado.",
+            10
+        )
+
+    return real
+
+
+def relative_path(local):
+    relative = os.path.relpath(
+        local,
+        LOCAL_ROOT
+    )
+
+    if (
+        relative == ".."
+        or relative.startswith("../")
+    ):
+        fail(
+            "Ruta relativa inválida.",
+            11
+        )
+
+    return relative
+
+
+def read_nas_baseline(relative):
+    if not os.path.ismount(NAS_ROOT):
+        return {
+            "status": "unavailable"
+        }
+
+    target = os.path.join(
+        NAS_ROOT,
+        relative
+    )
+
+    if not os.path.isfile(target):
+        return {
+            "status": "missing"
+        }
+
+    info = file_info(target)
+
+    return {
+        "status": "present",
+        "size": info["size"],
+        "mtime_ns": info["mtime_ns"],
+    }
+
+
+def load_state():
+    if not os.path.isfile(STATE_FILE):
+        return {
+            "version": 1,
+            "items": {},
+        }
+
+    try:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as handle:
+            state = json.load(handle)
+
+    except Exception as error:
+        fail(
+            f"No fue posible leer el registro: {error}",
+            20
+        )
+
+    if not isinstance(state, dict):
+        state = {}
+
+    if not isinstance(
+        state.get("items"),
+        dict
+    ):
+        state["items"] = {}
+
+    state["version"] = 1
+
+    return state
+
+
+def save_state(state):
+    directory = os.path.dirname(
+        STATE_FILE
+    )
+
+    os.makedirs(
+        directory,
+        exist_ok=True
+    )
+
+    fd, temporary = tempfile.mkstemp(
+        prefix=".castillo-pending-",
+        suffix=".tmp",
+        dir=directory
+    )
+
+    try:
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8"
+        ) as handle:
+            json.dump(
+                state,
+                handle,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True
+            )
+
+            handle.write("\n")
+            handle.flush()
+            os.fsync(
+                handle.fileno()
+            )
+
+        os.chmod(
+            temporary,
+            0o644
+        )
+
+        os.replace(
+            temporary,
+            STATE_FILE
+        )
+
+        dir_fd = os.open(
+            directory,
+            os.O_RDONLY
+        )
+
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def register_change(
+    local,
+    change_type,
+    audio_file=""
+):
+    local = resolve_local(local)
+    relative = relative_path(local)
+
+    state = load_state()
+    items = state["items"]
+
+    timestamp = now_iso()
+    current_local = file_info(local)
+
+    existing = items.get(relative)
+
+    if existing is None:
+        entry = {
+            "relative_path":
+                relative,
+
+            "audio_file":
+                audio_file,
+
+            "types": [
+                change_type
+            ],
+
+            "first_changed_at":
+                timestamp,
+
+            "last_changed_at":
+                timestamp,
+
+            "local":
+                current_local,
+
+            "nas_baseline":
+                read_nas_baseline(
+                    relative
+                ),
+        }
+
+    else:
+        entry = existing
+
+        types = set(
+            entry.get(
+                "types",
+                []
+            )
+        )
+
+        types.add(
+            change_type
+        )
+
+        entry["types"] = sorted(
+            types
+        )
+
+        entry["last_changed_at"] = (
+            timestamp
+        )
+
+        entry["local"] = (
+            current_local
+        )
+
+        if audio_file:
+            entry["audio_file"] = (
+                audio_file
+            )
+
+        if (
+            "first_changed_at"
+            not in entry
+        ):
+            entry["first_changed_at"] = (
+                timestamp
+            )
+
+        if (
+            "nas_baseline"
+            not in entry
+        ):
+            entry["nas_baseline"] = (
+                read_nas_baseline(
+                    relative
+                )
+            )
+
+    items[relative] = entry
+
+    save_state(state)
+
+    print(json.dumps(
+        {
+            "ok": True,
+            "item": entry,
+            "count": len(items),
+        },
+        ensure_ascii=False
+    ))
+
+
+def remove_change(local):
+    local = resolve_local(local)
+    relative = relative_path(local)
+
+    state = load_state()
+
+    removed = state["items"].pop(
+        relative,
+        None
+    )
+
+    save_state(state)
+
+    print(json.dumps(
+        {
+            "ok": True,
+            "removed":
+                removed is not None,
+            "relative_path":
+                relative,
+            "count":
+                len(state["items"]),
+        },
+        ensure_ascii=False
+    ))
+
+
+def list_changes():
+    state = load_state()
+
+    items = list(
+        state["items"].values()
+    )
+
+    items.sort(
+        key=lambda item:
+            item.get(
+                "last_changed_at",
+                ""
+            ),
+        reverse=True
+    )
+
+    print(json.dumps(
+        {
+            "ok": True,
+            "items": items,
+            "count": len(items),
+        },
+        ensure_ascii=False
+    ))
+
+
+parser = argparse.ArgumentParser()
+
+subparsers = parser.add_subparsers(
+    dest="command",
+    required=True
+)
+
+
+register_parser = (
+    subparsers.add_parser(
+        "register"
+    )
+)
+
+register_parser.add_argument(
+    "--local",
+    required=True
+)
+
+register_parser.add_argument(
+    "--type",
+    required=True,
+    choices=(
+        "lyrics",
+        "tags",
+        "artwork",
+    )
+)
+
+register_parser.add_argument(
+    "--audio-file",
+    default=""
+)
+
+
+remove_parser = (
+    subparsers.add_parser(
+        "remove"
+    )
+)
+
+remove_parser.add_argument(
+    "--local",
+    required=True
+)
+
+
+subparsers.add_parser(
+    "list"
+)
+
+
+args = parser.parse_args()
+
+
+if args.command == "register":
+    register_change(
+        args.local,
+        args.type,
+        args.audio_file
+    )
+
+elif args.command == "remove":
+    remove_change(
+        args.local
+    )
+
+elif args.command == "list":
+    list_changes()

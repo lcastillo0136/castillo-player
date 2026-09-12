@@ -1,0 +1,63 @@
+# Frontend build / dependencies
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/.vite-temp/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+
+# Castillo Player runtime
+runtime/
+data/
+state/
+waveforms/
+*.sqlite
+*.sqlite3
+
+# Runtime state files
+history.json
+library-cache.json
+pending-changes.json
+state.json
+last_success
+last_success_epoch
+
+# Local configuration / credentials
+castillo.ini
+.env
+.env.*
+!.env.example
+*.credentials
+*.credential
+*.secret
+*.secrets
+
+# Temporary / backup files
+*.new
+*.tmp
+*.bak
+*.backup
+*.old
+*.orig
+*~
+*.swp
+
+# Logs
+*.log
+
+# Development-only helper
+frontend/deploy.sh
+
+# Experimental helper excluded from v0.1.0
+castillo-mp3-vbr-repair
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local manual backups
+*.before-*

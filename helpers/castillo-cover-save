@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import json
+import os
+import sys
+
+from mutagen.id3 import (
+    APIC,
+    ID3,
+    ID3NoHeaderError,
+)
+
+from mutagen.flac import (
+    FLAC,
+    Picture,
+)
+
+from mutagen.mp4 import (
+    MP4,
+    MP4Cover,
+)
+
+
+CONFIG_FILE = (
+    "/etc/castillo-player/castillo.ini"
+)
+
+MAX_IMAGE_SIZE = (
+    10 * 1024 * 1024
+)
+
+
+def fail(message, code=1):
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": message,
+            },
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
+
+    sys.exit(code)
+
+
+def clean_ini_value(value):
+    value = value.strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        value = value[1:-1].strip()
+
+    return value
+
+
+def load_library_root():
+    if not os.path.isfile(
+        CONFIG_FILE
+    ):
+        fail(
+            (
+                "No existe la configuración "
+                "de Castillo Player."
+            ),
+            2,
+        )
+
+    parser = configparser.ConfigParser(
+        interpolation=None
+    )
+
+    try:
+        loaded = parser.read(
+            CONFIG_FILE,
+            encoding="utf-8",
+        )
+
+    except (
+        configparser.Error,
+        OSError,
+    ) as error:
+        fail(
+            (
+                "No fue posible leer la "
+                f"configuración: {error}"
+            ),
+            3,
+        )
+
+    if not loaded:
+        fail(
+            (
+                "No fue posible cargar la "
+                "configuración de Castillo Player."
+            ),
+            3,
+        )
+
+    try:
+        value = parser[
+            "core"
+        ][
+            "library_root"
+        ]
+
+    except KeyError:
+        fail(
+            (
+                "Falta [core] library_root "
+                "en la configuración."
+            ),
+            4,
+        )
+
+    value = clean_ini_value(
+        value
+    )
+
+    if (
+        value == ""
+        or not os.path.isabs(value)
+    ):
+        fail(
+            (
+                "library_root debe ser "
+                "una ruta absoluta."
+            ),
+            5,
+        )
+
+    root = os.path.realpath(
+        value
+    )
+
+    if root == os.path.sep:
+        fail(
+            (
+                "library_root no puede "
+                "ser la raíz del sistema."
+            ),
+            6,
+        )
+
+    if not os.path.isdir(
+        root
+    ):
+        fail(
+            (
+                "No existe la biblioteca "
+                "configurada."
+            ),
+            7,
+        )
+
+    return root
+
+
+def path_inside_root(
+    path,
+    root,
+):
+    try:
+        return (
+            os.path.commonpath(
+                [
+                    path,
+                    root,
+                ]
+            )
+            == root
+        )
+
+    except ValueError:
+        return False
+
+
+def detect_image(path):
+    if not os.path.isfile(path):
+        fail(
+            "No se encontró la imagen.",
+            20,
+        )
+
+    size = os.path.getsize(
+        path
+    )
+
+    if size <= 0:
+        fail(
+            "La imagen está vacía.",
+            21,
+        )
+
+    if size > MAX_IMAGE_SIZE:
+        fail(
+            "La imagen supera 10 MB.",
+            22,
+        )
+
+    with open(
+        path,
+        "rb",
+    ) as handle:
+        data = handle.read()
+
+    if data.startswith(
+        b"\xff\xd8\xff"
+    ):
+        return (
+            data,
+            "image/jpeg",
+        )
+
+    if data.startswith(
+        b"\x89PNG\r\n\x1a\n"
+    ):
+        return (
+            data,
+            "image/png",
+        )
+
+    fail(
+        "Solo se permiten imágenes JPEG o PNG.",
+        23,
+    )
+
+
+def save_mp3(
+    path,
+    data,
+    mime,
+):
+    try:
+        tags = ID3(
+            path
+        )
+
+    except ID3NoHeaderError:
+        tags = ID3()
+
+    tags.delall(
+        "APIC"
+    )
+
+    tags.add(
+        APIC(
+            encoding=3,
+            mime=mime,
+            type=3,
+            desc="Cover",
+            data=data,
+        )
+    )
+
+    tags.save(
+        path,
+        v2_version=4,
+    )
+
+
+def remove_mp3(path):
+    try:
+        tags = ID3(
+            path
+        )
+
+    except ID3NoHeaderError:
+        return
+
+    tags.delall(
+        "APIC"
+    )
+
+    tags.save(
+        path,
+        v2_version=4,
+    )
+
+
+def save_flac(
+    path,
+    data,
+    mime,
+):
+    audio = FLAC(
+        path
+    )
+
+    picture = Picture()
+
+    picture.type = 3
+    picture.mime = mime
+    picture.desc = "Cover"
+    picture.data = data
+
+    audio.clear_pictures()
+
+    audio.add_picture(
+        picture
+    )
+
+    audio.save()
+
+
+def remove_flac(path):
+    audio = FLAC(
+        path
+    )
+
+    audio.clear_pictures()
+    audio.save()
+
+
+def save_mp4(
+    path,
+    data,
+    mime,
+):
+    audio = MP4(
+        path
+    )
+
+    image_format = (
+        MP4Cover.FORMAT_PNG
+        if mime == "image/png"
+        else MP4Cover.FORMAT_JPEG
+    )
+
+    audio["covr"] = [
+        MP4Cover(
+            data,
+            imageformat=image_format,
+        )
+    ]
+
+    audio.save()
+
+
+def remove_mp4(path):
+    audio = MP4(
+        path
+    )
+
+    if "covr" in audio:
+        del audio["covr"]
+
+    audio.save()
+
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--audio",
+    required=True,
+)
+
+mode = (
+    parser
+    .add_mutually_exclusive_group(
+        required=True
+    )
+)
+
+mode.add_argument(
+    "--image"
+)
+
+mode.add_argument(
+    "--remove",
+    action="store_true",
+)
+
+args = parser.parse_args()
+
+
+#
+# ============================================================
+# Authorized library
+# ============================================================
+#
+# Este helper se ejecuta con privilegios.
+#
+# Por seguridad NO acepta library_root como argumento.
+# Obtiene la raíz autorizada directamente de la
+# configuración central de Castillo Player.
+#
+
+ROOT = load_library_root()
+
+
+#
+# ============================================================
+# Audio path
+# ============================================================
+#
+
+audio = os.path.realpath(
+    args.audio
+)
+
+
+if (
+    not os.path.isfile(audio)
+    or not path_inside_root(
+        audio,
+        ROOT,
+    )
+    or audio == ROOT
+):
+    fail(
+        "Archivo de audio no autorizado.",
+        10,
+    )
+
+
+extension = (
+    os.path.splitext(
+        audio
+    )[1].lower()
+)
+
+
+if extension == ".mp3":
+    kind = "mp3"
+
+elif extension == ".flac":
+    kind = "flac"
+
+elif extension in (
+    ".m4a",
+    ".mp4",
+    ".aac",
+):
+    kind = "mp4"
+
+else:
+    fail(
+        (
+            "Este formato todavía no admite "
+            "edición de portada."
+        ),
+        11,
+    )
+
+
+#
+# ============================================================
+# Remove artwork
+# ============================================================
+#
+
+if args.remove:
+    try:
+        if kind == "mp3":
+            remove_mp3(
+                audio
+            )
+
+        elif kind == "flac":
+            remove_flac(
+                audio
+            )
+
+        else:
+            remove_mp4(
+                audio
+            )
+
+    except Exception as error:
+        fail(
+            (
+                "No fue posible eliminar "
+                f"la portada: {error}"
+            ),
+            30,
+        )
+
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "removed": True,
+                "file": audio,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    raise SystemExit
+
+
+#
+# ============================================================
+# Save artwork
+# ============================================================
+#
+
+data, mime = detect_image(
+    args.image
+)
+
+
+try:
+    if kind == "mp3":
+        save_mp3(
+            audio,
+            data,
+            mime,
+        )
+
+    elif kind == "flac":
+        save_flac(
+            audio,
+            data,
+            mime,
+        )
+
+    else:
+        save_mp4(
+            audio,
+            data,
+            mime,
+        )
+
+except Exception as error:
+    fail(
+        (
+            "No fue posible guardar "
+            f"la portada: {error}"
+        ),
+        31,
+    )
+
+
+print(
+    json.dumps(
+        {
+            "ok": True,
+            "removed": False,
+            "file": audio,
+            "mime": mime,
+            "size": len(data),
+        },
+        ensure_ascii=False,
+    )
+)

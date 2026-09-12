@@ -1,0 +1,3 @@
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-pending-change
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-pending-check
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-pending-sync

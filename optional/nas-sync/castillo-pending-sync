@@ -1,0 +1,2008 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import fcntl
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+
+CONFIG_FILE = "/etc/castillo-player/castillo.ini"
+
+RUN_DIR = "/run/castillo-player"
+
+CREDENTIALS_FILE = os.path.join(
+    RUN_DIR,
+    "nas-rw.credentials"
+)
+
+OWN_LOCK_FILE = (
+    "/run/castillo-pending-sync.lock"
+)
+
+MIRROR_LOCK_FILE = (
+    "/run/nas-music-sync.lock"
+)
+
+
+def emit(
+    obj,
+    stream=sys.stdout
+):
+    print(
+        json.dumps(
+            obj,
+            ensure_ascii=False
+        ),
+        file=stream
+    )
+
+
+def fail(
+    message,
+    code=1,
+    **extra
+):
+    payload = {
+        "ok": False,
+        "error": message
+    }
+
+    payload.update(
+        extra
+    )
+
+    emit(
+        payload,
+        sys.stderr
+    )
+
+    raise SystemExit(
+        code
+    )
+
+
+def clean_ini_value(value):
+    value = str(value).strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        value = value[1:-1].strip()
+
+    return value
+
+
+def config_boolean(value):
+    value = clean_ini_value(
+        value
+    ).casefold()
+
+    if value in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+
+    if value in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return False
+
+    fail(
+        "Valor inválido para nas.enabled.",
+        4,
+    )
+
+
+def validate_config_file():
+    if not os.path.isfile(
+        CONFIG_FILE
+    ):
+        fail(
+            "No existe la configuración de Castillo Player.",
+            2,
+        )
+
+    try:
+        stat_info = os.stat(
+            CONFIG_FILE
+        )
+
+    except OSError as error:
+        fail(
+            f"No fue posible revisar la configuración: {error}",
+            2,
+        )
+
+    if stat_info.st_uid != 0:
+        fail(
+            "La configuración de Castillo Player debe pertenecer a root.",
+            2,
+        )
+
+    if stat_info.st_mode & 0o022:
+        fail(
+            "La configuración de Castillo Player no puede ser escribible "
+            "por grupo u otros usuarios.",
+            2,
+        )
+
+
+def load_castillo_config():
+    validate_config_file()
+
+    parser = configparser.ConfigParser(
+        interpolation=None
+    )
+
+    try:
+        loaded = parser.read(
+            CONFIG_FILE,
+            encoding="utf-8",
+        )
+
+    except (
+        configparser.Error,
+        OSError,
+    ) as error:
+        fail(
+            f"No fue posible leer la configuración: {error}",
+            3,
+        )
+
+    if not loaded:
+        fail(
+            "No fue posible cargar la configuración de Castillo Player.",
+            3,
+        )
+
+    try:
+        local_root = clean_ini_value(
+            parser["core"]["library_root"]
+        )
+
+        state_dir = clean_ini_value(
+            parser["core"]["state_dir"]
+        )
+
+        helper_dir = clean_ini_value(
+            parser["core"]["helper_dir"]
+        )
+
+        moode_db = clean_ini_value(
+            parser["moode"]["db_path"]
+        )
+
+        nas_enabled = config_boolean(
+            parser["nas"]["enabled"]
+        )
+
+        rw_mount = clean_ini_value(
+            parser["nas"]["readwrite_root"]
+        )
+
+        source_name = clean_ini_value(
+            parser["nas"]["source_name"]
+        )
+
+    except KeyError as error:
+        fail(
+            f"Falta configuración requerida: {error}",
+            4,
+        )
+
+    if not nas_enabled:
+        fail(
+            "El módulo NAS está deshabilitado.",
+            5,
+        )
+
+    for name, value in (
+        ("library_root", local_root),
+        ("state_dir", state_dir),
+        ("helper_dir", helper_dir),
+        ("moode.db_path", moode_db),
+        ("nas.readwrite_root", rw_mount),
+    ):
+        if (
+            not value
+            or not os.path.isabs(
+                value
+            )
+        ):
+            fail(
+                f"{name} debe ser una ruta absoluta.",
+                6,
+            )
+
+    if (
+        not source_name
+        or "\n" in source_name
+        or "\r" in source_name
+    ):
+        fail(
+            "nas.source_name no es válido.",
+            6,
+        )
+
+    local_root = os.path.realpath(
+        local_root
+    )
+
+    state_dir = os.path.realpath(
+        state_dir
+    )
+
+    helper_dir = os.path.realpath(
+        helper_dir
+    )
+
+    moode_db = os.path.realpath(
+        moode_db
+    )
+
+    rw_mount = os.path.realpath(
+        rw_mount
+    )
+
+    if local_root == os.path.sep:
+        fail(
+            "library_root no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if state_dir == os.path.sep:
+        fail(
+            "state_dir no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if helper_dir == os.path.sep:
+        fail(
+            "helper_dir no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if rw_mount == os.path.sep:
+        fail(
+            "nas.readwrite_root no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if not os.path.isdir(
+        local_root
+    ):
+        fail(
+            "No existe la biblioteca local configurada.",
+            8,
+        )
+
+    if not os.path.isfile(
+        moode_db
+    ):
+        fail(
+            "No existe la base de datos configurada de moOde.",
+            8,
+        )
+
+    pending_helper = os.path.join(
+        helper_dir,
+        "castillo-pending-change",
+    )
+
+    if (
+        not os.path.isfile(
+            pending_helper
+        )
+        or not os.access(
+            pending_helper,
+            os.X_OK
+        )
+    ):
+        fail(
+            "No está disponible castillo-pending-change.",
+            8,
+        )
+
+    state_file = os.path.join(
+        state_dir,
+        "pending-changes.json",
+    )
+
+    return (
+        local_root,
+        rw_mount,
+        state_file,
+        moode_db,
+        pending_helper,
+        source_name,
+    )
+
+
+def path_inside_root(
+    path,
+    root,
+):
+    try:
+        return (
+            os.path.commonpath(
+                [
+                    path,
+                    root,
+                ]
+            )
+            == root
+        )
+
+    except ValueError:
+        return False
+
+
+(
+    LOCAL_ROOT,
+    RW_MOUNT,
+    STATE_FILE,
+    MOODE_DB,
+    PENDING_HELPER,
+    NAS_SOURCE_NAME,
+) = load_castillo_config()
+
+
+def command_path(
+    *candidates
+):
+    for candidate in candidates:
+        if (
+            candidate
+            and os.path.isfile(
+                candidate
+            )
+            and os.access(
+                candidate,
+                os.X_OK
+            )
+        ):
+            return candidate
+
+    for candidate in candidates:
+        if not candidate:
+            continue
+
+        found = shutil.which(
+            os.path.basename(
+                candidate
+            )
+        )
+
+        if found:
+            return found
+
+    return None
+
+
+def file_info(
+    path
+):
+    stat = os.stat(
+        path
+    )
+
+    return {
+        "size":
+            int(
+                stat.st_size
+            ),
+
+        "mtime_ns":
+            int(
+                stat.st_mtime_ns
+            )
+    }
+
+
+def sha256_file(
+    path,
+    chunk_size=1024 * 1024
+):
+    digest = hashlib.sha256()
+
+    with open(
+        path,
+        "rb"
+    ) as handle:
+
+        while True:
+            chunk = handle.read(
+                chunk_size
+            )
+
+            if not chunk:
+                break
+
+            digest.update(
+                chunk
+            )
+
+    return digest.hexdigest()
+
+
+def normalize_relative(
+    value
+):
+    value = str(
+        value or ""
+    ).strip()
+
+    if not value:
+        fail(
+            "Ruta relativa vacía.",
+            10
+        )
+
+    normalized = os.path.normpath(
+        value
+    )
+
+    if (
+        normalized == ".."
+        or normalized.startswith(
+            "../"
+        )
+        or os.path.isabs(
+            normalized
+        )
+    ):
+        fail(
+            "Ruta relativa no autorizada.",
+            11
+        )
+
+    return normalized
+
+
+def resolve_local(
+    relative
+):
+    relative = normalize_relative(
+        relative
+    )
+
+    path = os.path.realpath(
+        os.path.join(
+            LOCAL_ROOT,
+            relative
+        )
+    )
+
+    if (
+        path == LOCAL_ROOT
+        or not path_inside_root(
+            path,
+            LOCAL_ROOT,
+        )
+        or not os.path.isfile(
+            path
+        )
+    ):
+        fail(
+            "Archivo local no autorizado "
+            f"o inexistente: {relative}",
+            12
+        )
+
+    return path
+
+
+def load_state():
+    if not os.path.isfile(
+        STATE_FILE
+    ):
+        return {
+            "version": 1,
+            "items": {}
+        }
+
+    try:
+        with open(
+            STATE_FILE,
+            "r",
+            encoding="utf-8"
+        ) as handle:
+
+            state = json.load(
+                handle
+            )
+
+    except Exception as error:
+        fail(
+            "No fue posible leer "
+            f"pendientes: {error}",
+            20
+        )
+
+    if (
+        not isinstance(
+            state,
+            dict
+        )
+        or not isinstance(
+            state.get(
+                "items"
+            ),
+            dict
+        )
+    ):
+        fail(
+            "Registro de pendientes inválido.",
+            21
+        )
+
+    return state
+
+
+def acquire_lock(
+    path,
+    label
+):
+    handle = open(
+        path,
+        "a+"
+    )
+
+    try:
+        fcntl.flock(
+            handle.fileno(),
+            fcntl.LOCK_EX |
+            fcntl.LOCK_NB
+        )
+
+    except BlockingIOError:
+        handle.close()
+
+        fail(
+            f"{label} está ocupado. "
+            "Intenta nuevamente más tarde.",
+            30
+        )
+
+    return handle
+
+
+def read_source_config():
+    if not os.path.isfile(
+        MOODE_DB
+    ):
+        fail(
+            "No se encontró la base "
+            "de datos de moOde.",
+            40
+        )
+
+
+    connection = sqlite3.connect(
+        MOODE_DB
+    )
+
+    connection.row_factory = (
+        sqlite3.Row
+    )
+
+
+    try:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM cfg_source
+            WHERE name = ?
+            LIMIT 1
+            """,
+            (
+                NAS_SOURCE_NAME,
+            )
+        ).fetchone()
+
+    finally:
+        connection.close()
+
+
+    if row is None:
+        fail(
+            "No se encontró la fuente NAS configurada "
+            f"({NAS_SOURCE_NAME}) en moOde.",
+            41
+        )
+
+
+    cfg = dict(
+        row
+    )
+
+
+    if (
+        str(
+            cfg.get(
+                "type",
+                ""
+            )
+        ).lower()
+        not in (
+            "cifs",
+            "smb"
+        )
+    ):
+        fail(
+            "La fuente NAS configurada no es una "
+            "fuente CIFS/SMB.",
+            42
+        )
+
+
+    address = str(
+        cfg.get(
+            "address"
+        ) or ""
+    ).strip()
+
+    remotedir = str(
+        cfg.get(
+            "remotedir"
+        ) or ""
+    ).strip().strip("/")
+
+    username = str(
+        cfg.get(
+            "username"
+        ) or ""
+    )
+
+    password = str(
+        cfg.get(
+            "password"
+        ) or ""
+    )
+
+
+    if (
+        not address
+        or not remotedir
+        or not username
+    ):
+        fail(
+            "La configuración CIFS "
+            "de la fuente NAS está incompleta.",
+            43
+        )
+
+
+    if any(
+        character
+        in username + password
+        for character in (
+            "\n",
+            "\r"
+        )
+    ):
+        fail(
+            "Las credenciales contienen "
+            "caracteres no admitidos.",
+            44
+        )
+
+
+    parts = [
+        part
+        for part
+        in remotedir.split("/")
+        if part
+    ]
+
+
+    if (
+        not parts
+        or any(
+            part in (
+                ".",
+                ".."
+            )
+            for part in parts
+        )
+    ):
+        fail(
+            "Ruta remota CIFS inválida.",
+            45
+        )
+
+
+    return {
+        "address":
+            address,
+
+        "remotedir":
+            "/".join(
+                parts
+            ),
+
+        "username":
+            username,
+
+        "password":
+            password,
+
+        "rsize":
+            int(
+                cfg.get(
+                    "rsize"
+                ) or 0
+            ),
+
+        "wsize":
+            int(
+                cfg.get(
+                    "wsize"
+                ) or 0
+            )
+    }
+
+
+def write_credentials(
+    cfg
+):
+    os.makedirs(
+        RUN_DIR,
+        mode=0o700,
+        exist_ok=True
+    )
+
+    os.chmod(
+        RUN_DIR,
+        0o700
+    )
+
+
+    fd = os.open(
+        CREDENTIALS_FILE,
+
+        os.O_WRONLY |
+        os.O_CREAT |
+        os.O_TRUNC,
+
+        0o600
+    )
+
+
+    with os.fdopen(
+        fd,
+        "w",
+        encoding="utf-8"
+    ) as handle:
+
+        handle.write(
+            "username=" +
+            cfg["username"] +
+            "\n"
+        )
+
+        handle.write(
+            "password=" +
+            cfg["password"] +
+            "\n"
+        )
+
+        handle.flush()
+
+        os.fsync(
+            handle.fileno()
+        )
+
+
+    os.chmod(
+        CREDENTIALS_FILE,
+        0o600
+    )
+
+
+def exact_mount_exists(
+    path
+):
+    findmnt = command_path(
+        "/usr/bin/findmnt",
+        "/bin/findmnt"
+    )
+
+    if not findmnt:
+        fail(
+            "No se encontró findmnt.",
+            46
+        )
+
+
+    result = subprocess.run(
+        [
+            findmnt,
+            "-rn",
+            "-M",
+            path
+        ],
+
+        stdout=
+            subprocess.DEVNULL,
+
+        stderr=
+            subprocess.DEVNULL,
+
+        check=False
+    )
+
+
+    return (
+        result.returncode == 0
+    )
+
+
+def unmount_rw():
+    if not exact_mount_exists(
+        RW_MOUNT
+    ):
+        return ""
+
+
+    umount = command_path(
+        "/usr/bin/umount",
+        "/bin/umount"
+    )
+
+
+    if not umount:
+        return (
+            "No se encontró umount."
+        )
+
+
+    result = subprocess.run(
+        [
+            umount,
+            RW_MOUNT
+        ],
+
+        stdout=
+            subprocess.PIPE,
+
+        stderr=
+            subprocess.PIPE,
+
+        text=True,
+        check=False
+    )
+
+
+    if result.returncode != 0:
+        return (
+            result.stderr.strip()
+            or
+            "No fue posible desmontar "
+            "el NAS temporal."
+        )
+
+
+    return ""
+
+
+def mount_rw(
+    cfg
+):
+    mount_cifs = command_path(
+        "/usr/sbin/mount.cifs",
+        "/sbin/mount.cifs"
+    )
+
+
+    if not mount_cifs:
+        fail(
+            "No se encontró mount.cifs.",
+            50
+        )
+
+
+    os.makedirs(
+        RW_MOUNT,
+        mode=0o755,
+        exist_ok=True
+    )
+
+
+    if exact_mount_exists(
+        RW_MOUNT
+    ):
+        fail(
+            "El punto temporal ya "
+            "está montado.",
+            51
+        )
+
+
+    write_credentials(
+        cfg
+    )
+
+
+    #
+    # IMPORTANTE:
+    # usamos el UNC completo de la fuente
+    # configurada en moOde.
+    #
+    source = (
+        "//" +
+        cfg["address"] +
+        "/" +
+        cfg["remotedir"]
+    )
+
+
+    options = [
+        "rw",
+        "vers=3.1.1",
+
+        "credentials=" +
+        CREDENTIALS_FILE,
+
+        "noserverino",
+        "cache=none",
+
+        "uid=0",
+        "gid=0",
+
+        "dir_mode=0777",
+        "file_mode=0777",
+
+        "iocharset=utf8"
+    ]
+
+
+    if cfg["rsize"] > 0:
+        options.append(
+            "rsize=" +
+            str(
+                cfg["rsize"]
+            )
+        )
+
+
+    if cfg["wsize"] > 0:
+        options.append(
+            "wsize=" +
+            str(
+                cfg["wsize"]
+            )
+        )
+
+
+    result = subprocess.run(
+        [
+            mount_cifs,
+            source,
+            RW_MOUNT,
+            "-o",
+            ",".join(
+                options
+            )
+        ],
+
+        stdout=
+            subprocess.PIPE,
+
+        stderr=
+            subprocess.PIPE,
+
+        text=True,
+        check=False
+    )
+
+
+    if result.returncode != 0:
+        fail(
+            "No fue posible montar "
+            "el NAS en modo escritura.",
+            52,
+
+            detail=
+                result.stderr.strip()
+        )
+
+
+    findmnt = command_path(
+        "/usr/bin/findmnt",
+        "/bin/findmnt"
+    )
+
+
+    verify = subprocess.run(
+        [
+            findmnt,
+            "-rn",
+            "-M",
+            RW_MOUNT,
+            "-o",
+            "SOURCE,FSTYPE,OPTIONS"
+        ],
+
+        stdout=
+            subprocess.PIPE,
+
+        stderr=
+            subprocess.PIPE,
+
+        text=True,
+        check=False
+    )
+
+
+    verify_text = (
+        verify.stdout.strip()
+    )
+
+    verify_fields = (
+        verify_text.split(
+            None,
+            2
+        )
+    )
+
+
+    if (
+        verify.returncode != 0
+        or len(
+            verify_fields
+        ) < 3
+    ):
+        unmount_rw()
+
+        fail(
+            "No fue posible verificar "
+            "el montaje temporal.",
+            53
+        )
+
+
+    mounted_source = (
+        verify_fields[0]
+    )
+
+    mounted_fstype = (
+        verify_fields[1]
+    )
+
+    mounted_options = (
+        verify_fields[2]
+        .split(",")
+    )
+
+
+    expected_source = (
+        source
+    )
+
+
+    if (
+        mounted_source
+        != expected_source
+
+        or mounted_fstype.lower()
+        != "cifs"
+
+        or "rw"
+        not in mounted_options
+    ):
+        unmount_rw()
+
+        fail(
+            "El montaje temporal no coincide "
+            "con la fuente esperada o no quedó "
+            "en modo escritura.",
+            54,
+
+            expected_source=
+                expected_source,
+
+            mounted_source=
+                mounted_source
+        )
+
+
+def remove_credentials():
+    try:
+        os.unlink(
+            CREDENTIALS_FILE
+        )
+
+    except FileNotFoundError:
+        pass
+
+
+def current_nas_state(
+    relative
+):
+    relative = normalize_relative(
+        relative
+    )
+
+
+    target = os.path.join(
+        RW_MOUNT,
+        relative
+    )
+
+
+    root = os.path.realpath(
+        RW_MOUNT
+    )
+
+    parent = os.path.realpath(
+        os.path.dirname(
+            target
+        )
+    )
+
+
+    if not path_inside_root(
+        parent,
+        root,
+    ):
+        return {
+            "status":
+                "invalid"
+        }
+
+
+    if not os.path.isfile(
+        target
+    ):
+        return {
+            "status":
+                "missing"
+        }
+
+
+    info = file_info(
+        target
+    )
+
+
+    return {
+        "status":
+            "present",
+
+        "size":
+            info["size"],
+
+        "mtime_ns":
+            info["mtime_ns"]
+    }
+
+
+def readiness(
+    item
+):
+    relative = normalize_relative(
+        item.get(
+            "relative_path",
+            ""
+        )
+    )
+
+
+    local = resolve_local(
+        relative
+    )
+
+
+    current_local = file_info(
+        local
+    )
+
+
+    registered_local = (
+        item.get(
+            "local"
+        )
+        or {}
+    )
+
+
+    if (
+        int(
+            registered_local.get(
+                "size",
+                -1
+            )
+        )
+        != current_local["size"]
+
+        or
+
+        int(
+            registered_local.get(
+                "mtime_ns",
+                -1
+            )
+        )
+        != current_local["mtime_ns"]
+    ):
+        return (
+            False,
+            "local_changed",
+            "El archivo local cambió "
+            "después de registrarse."
+        )
+
+
+    baseline = (
+        item.get(
+            "nas_baseline"
+        )
+        or {
+            "status":
+                "unavailable"
+        }
+    )
+
+
+    current = current_nas_state(
+        relative
+    )
+
+
+    baseline_status = (
+        baseline.get(
+            "status"
+        )
+    )
+
+    current_status = (
+        current.get(
+            "status"
+        )
+    )
+
+
+    if current_status == "invalid":
+        return (
+            False,
+            "invalid_path",
+            "La ruta NAS no es válida."
+        )
+
+
+    if (
+        baseline_status
+        == "unavailable"
+    ):
+        return (
+            False,
+            "baseline_unavailable",
+            "No existe una referencia "
+            "inicial válida del NAS."
+        )
+
+
+    if (
+        baseline_status
+        == "missing"
+    ):
+        if (
+            current_status
+            == "missing"
+        ):
+            return (
+                True,
+                "new_file",
+                "Archivo nuevo para el NAS."
+            )
+
+        return (
+            False,
+            "appeared_on_nas",
+            "El archivo apareció en el NAS "
+            "después de iniciar la edición."
+        )
+
+
+    if (
+        baseline_status
+        == "present"
+    ):
+        if (
+            current_status
+            == "missing"
+        ):
+            return (
+                False,
+                "deleted_on_nas",
+                "El archivo fue eliminado "
+                "del NAS después de iniciar "
+                "la edición."
+            )
+
+
+        same_size = (
+            int(
+                baseline.get(
+                    "size",
+                    -1
+                )
+            )
+            ==
+            int(
+                current.get(
+                    "size",
+                    -2
+                )
+            )
+        )
+
+
+        same_mtime = (
+            int(
+                baseline.get(
+                    "mtime_ns",
+                    -1
+                )
+            )
+            ==
+            int(
+                current.get(
+                    "mtime_ns",
+                    -2
+                )
+            )
+        )
+
+
+        if (
+            same_size
+            and same_mtime
+        ):
+            return (
+                True,
+                "unchanged",
+                "El archivo del NAS "
+                "no ha cambiado."
+            )
+
+
+        return (
+            False,
+            "nas_changed",
+            "El archivo del NAS cambió "
+            "después de iniciar la edición."
+        )
+
+
+    return (
+        False,
+        "invalid_baseline",
+        "La referencia inicial del NAS "
+        "no es válida."
+    )
+
+
+def remove_pending(
+    local
+):
+    result = subprocess.run(
+        [
+            PENDING_HELPER,
+
+            "remove",
+
+            "--local",
+            local
+        ],
+
+        stdout=
+            subprocess.PIPE,
+
+        stderr=
+            subprocess.PIPE,
+
+        text=True,
+        check=False
+    )
+
+
+    if result.returncode != 0:
+        return (
+            result.stderr.strip()
+            or
+            "No fue posible quitar "
+            "el pendiente."
+        )
+
+
+    return ""
+
+
+def sync_one(
+    relative,
+    item
+):
+    local = resolve_local(
+        relative
+    )
+
+
+    ready, reason, message = (
+        readiness(
+            item
+        )
+    )
+
+
+    if not ready:
+        return {
+            "relative_path":
+                relative,
+
+            "status":
+                "conflict",
+
+            "reason":
+                reason,
+
+            "message":
+                message
+        }
+
+
+    before = file_info(
+        local
+    )
+
+
+    local_hash = sha256_file(
+        local
+    )
+
+
+    target = os.path.join(
+        RW_MOUNT,
+        relative
+    )
+
+
+    target_dir = os.path.dirname(
+        target
+    )
+
+
+    os.makedirs(
+        target_dir,
+        exist_ok=True
+    )
+
+
+    ready, reason, message = (
+        readiness(
+            item
+        )
+    )
+
+
+    if not ready:
+        return {
+            "relative_path":
+                relative,
+
+            "status":
+                "conflict",
+
+            "reason":
+                reason,
+
+            "message":
+                message
+        }
+
+
+    fd, temporary = tempfile.mkstemp(
+        prefix=".castillo-upload-",
+        suffix=".tmp",
+        dir=target_dir
+    )
+
+
+    os.close(
+        fd
+    )
+
+
+    try:
+        shutil.copyfile(
+            local,
+            temporary
+        )
+
+
+        try:
+            local_stat = os.stat(
+                local
+            )
+
+            os.utime(
+                temporary,
+
+                ns=(
+                    local_stat.st_atime_ns,
+                    local_stat.st_mtime_ns
+                )
+            )
+
+        except OSError:
+            pass
+
+
+        with open(
+            temporary,
+            "rb+"
+        ) as handle:
+
+            handle.flush()
+
+            os.fsync(
+                handle.fileno()
+            )
+
+
+        after = file_info(
+            local
+        )
+
+
+        if (
+            after != before
+        ):
+            raise RuntimeError(
+                "El archivo local cambió "
+                "durante la copia."
+            )
+
+
+        if (
+            os.path.getsize(
+                temporary
+            )
+            != before["size"]
+        ):
+            raise RuntimeError(
+                "El tamaño copiado no coincide "
+                "con el archivo local."
+            )
+
+
+        remote_hash = sha256_file(
+            temporary
+        )
+
+
+        if (
+            remote_hash
+            != local_hash
+        ):
+            raise RuntimeError(
+                "La verificación SHA-256 "
+                "del archivo copiado falló."
+            )
+
+
+        ready, reason, message = (
+            readiness(
+                item
+            )
+        )
+
+
+        if not ready:
+            raise RuntimeError(
+                message
+            )
+
+
+        os.replace(
+            temporary,
+            target
+        )
+
+
+        if (
+            not os.path.isfile(
+                target
+            )
+            or
+            os.path.getsize(
+                target
+            )
+            != before["size"]
+        ):
+            raise RuntimeError(
+                "La verificación final "
+                "del archivo NAS falló."
+            )
+
+
+        pending_error = (
+            remove_pending(
+                local
+            )
+        )
+
+
+        result = {
+            "relative_path":
+                relative,
+
+            "status":
+                "synced",
+
+            "size":
+                before["size"],
+
+            "sha256":
+                local_hash
+        }
+
+
+        if pending_error:
+            result["warning"] = (
+                pending_error
+            )
+
+
+        return result
+
+
+    except Exception as error:
+
+        if os.path.exists(
+            temporary
+        ):
+            try:
+                os.unlink(
+                    temporary
+                )
+
+            except OSError:
+                pass
+
+
+        return {
+            "relative_path":
+                relative,
+
+            "status":
+                "failed",
+
+            "reason":
+                "copy_failed",
+
+            "message":
+                str(
+                    error
+                )
+        }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+
+    parser.add_argument(
+        "--relative",
+        action="append",
+        default=[]
+    )
+
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true"
+    )
+
+
+    args = parser.parse_args()
+
+
+    requested = [
+        normalize_relative(
+            value
+        )
+        for value
+        in args.relative
+    ]
+
+
+    if not requested:
+        fail(
+            "No se seleccionaron archivos "
+            "para sincronizar.",
+            60
+        )
+
+
+    requested = list(
+        dict.fromkeys(
+            requested
+        )
+    )
+
+
+    own_lock = acquire_lock(
+        OWN_LOCK_FILE,
+        "La sincronización USB → NAS"
+    )
+
+
+    mirror_lock = acquire_lock(
+        MIRROR_LOCK_FILE,
+        "La sincronización NAS → USB"
+    )
+
+
+    mounted = False
+
+
+    try:
+        state = load_state()
+
+        selected = []
+
+
+        for relative in requested:
+            item = state[
+                "items"
+            ].get(
+                relative
+            )
+
+
+            if item is None:
+                fail(
+                    "El archivo no está "
+                    f"pendiente: {relative}",
+                    61
+                )
+
+
+            selected.append(
+                (
+                    relative,
+                    item
+                )
+            )
+
+
+        cfg = read_source_config()
+
+
+        mount_rw(
+            cfg
+        )
+
+
+        mounted = True
+
+
+        preflight = []
+
+
+        for relative, item in selected:
+            ready, reason, message = (
+                readiness(
+                    item
+                )
+            )
+
+
+            preflight.append({
+                "relative_path":
+                    relative,
+
+                "status":
+                    (
+                        "ready"
+                        if ready
+                        else "conflict"
+                    ),
+
+                "reason":
+                    reason,
+
+                "message":
+                    message
+            })
+
+
+        not_ready = [
+            item
+            for item
+            in preflight
+            if (
+                item["status"]
+                != "ready"
+            )
+        ]
+
+
+        if not_ready:
+            emit(
+                {
+                    "ok":
+                        False,
+
+                    "error":
+                        "La selección ya no "
+                        "está lista para sincronizar.",
+
+                    "items":
+                        preflight,
+
+                    "synced":
+                        0
+                },
+
+                sys.stderr
+            )
+
+
+            raise SystemExit(
+                62
+            )
+
+
+        if args.dry_run:
+            emit({
+                "ok":
+                    True,
+
+                "dry_run":
+                    True,
+
+                "items":
+                    preflight,
+
+                "count":
+                    len(
+                        preflight
+                    ),
+
+                "can_sync":
+                    True
+            })
+
+
+            return
+
+
+        results = []
+
+
+        for relative, item in selected:
+            results.append(
+                sync_one(
+                    relative,
+                    item
+                )
+            )
+
+
+        synced = sum(
+            1
+            for item
+            in results
+            if (
+                item["status"]
+                == "synced"
+            )
+        )
+
+
+        failed = (
+            len(
+                results
+            )
+            -
+            synced
+        )
+
+
+        emit({
+            "ok":
+                failed == 0,
+
+            "dry_run":
+                False,
+
+            "items":
+                results,
+
+            "count":
+                len(
+                    results
+                ),
+
+            "synced":
+                synced,
+
+            "failed":
+                failed
+        })
+
+
+        if failed:
+            raise SystemExit(
+                70
+            )
+
+
+    finally:
+        unmount_error = ""
+
+
+        if mounted:
+            unmount_error = (
+                unmount_rw()
+            )
+
+
+        remove_credentials()
+
+
+        try:
+            fcntl.flock(
+                mirror_lock.fileno(),
+                fcntl.LOCK_UN
+            )
+
+            mirror_lock.close()
+
+        except Exception:
+            pass
+
+
+        try:
+            fcntl.flock(
+                own_lock.fileno(),
+                fcntl.LOCK_UN
+            )
+
+            own_lock.close()
+
+        except Exception:
+            pass
+
+
+        if unmount_error:
+            print(
+                "[Castillo] Advertencia "
+                "al desmontar RW: "
+                +
+                unmount_error,
+
+                file=sys.stderr
+            )
+
+
+if __name__ == "__main__":
+    main()

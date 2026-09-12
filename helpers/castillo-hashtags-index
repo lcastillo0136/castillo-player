@@ -1,0 +1,1421 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import grp
+import json
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import unicodedata
+from pathlib import Path
+
+from mutagen import File
+from mutagen.id3 import ID3
+from mutagen.mp4 import MP4Tags
+
+
+CONFIG_FILE = "/etc/castillo-player/castillo.ini"
+
+CASTILLO_HASHTAGS_KEY = "CASTILLO_HASHTAGS"
+MP4_HASHTAGS_KEY = "----:com.apple.iTunes:CASTILLO_HASHTAGS"
+
+SUPPORTED_EXTENSIONS = {
+    ".mp3",
+    ".flac",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".m4a",
+    ".mp4",
+}
+
+
+def fail(message, code=1):
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": message,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        file=sys.stderr,
+    )
+    sys.exit(code)
+
+
+def clean_ini_value(value):
+    value = value.strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        value = value[1:-1].strip()
+
+    return value
+
+
+def normalize_mpd_prefix(value):
+    value = clean_ini_value(
+        value
+    )
+
+    value = value.replace(
+        "\\",
+        "/"
+    ).strip()
+
+    value = value.strip("/")
+
+    while "//" in value:
+        value = value.replace(
+            "//",
+            "/"
+        )
+
+    if not value:
+        fail(
+            "library_mpd_prefix no puede estar vacío.",
+            5,
+        )
+
+    return value + "/"
+
+
+def load_castillo_config():
+    if not os.path.isfile(
+        CONFIG_FILE
+    ):
+        fail(
+            "No existe la configuración de Castillo Player.",
+            2,
+        )
+
+    parser = configparser.ConfigParser(
+        interpolation=None
+    )
+
+    try:
+        loaded = parser.read(
+            CONFIG_FILE,
+            encoding="utf-8",
+        )
+
+    except (
+        configparser.Error,
+        OSError,
+    ) as error:
+        fail(
+            f"No fue posible leer la configuración: {error}",
+            3,
+        )
+
+    if not loaded:
+        fail(
+            "No fue posible cargar la configuración de Castillo Player.",
+            3,
+        )
+
+    try:
+        library_root = clean_ini_value(
+            parser["core"]["library_root"]
+        )
+
+        logical_prefix = normalize_mpd_prefix(
+            parser["core"]["library_mpd_prefix"]
+        )
+
+        state_dir = clean_ini_value(
+            parser["core"]["state_dir"]
+        )
+
+    except KeyError as error:
+        fail(
+            f"Falta configuración requerida: {error}",
+            4,
+        )
+
+    if (
+        not library_root
+        or not os.path.isabs(
+            library_root
+        )
+    ):
+        fail(
+            "library_root debe ser una ruta absoluta.",
+            6,
+        )
+
+    if (
+        not state_dir
+        or not os.path.isabs(
+            state_dir
+        )
+    ):
+        fail(
+            "state_dir debe ser una ruta absoluta.",
+            7,
+        )
+
+    root = os.path.realpath(
+        library_root
+    )
+
+    runtime_dir = os.path.realpath(
+        state_dir
+    )
+
+    if root == os.path.sep:
+        fail(
+            "library_root no puede ser la raíz del sistema.",
+            8,
+        )
+
+    if runtime_dir == os.path.sep:
+        fail(
+            "state_dir no puede ser la raíz del sistema.",
+            9,
+        )
+
+    database = os.path.join(
+        runtime_dir,
+        "hashtags.sqlite",
+    )
+
+    return (
+        root,
+        database,
+        logical_prefix,
+    )
+
+
+def path_inside_root(
+    path,
+    root,
+):
+    try:
+        return (
+            os.path.commonpath(
+                [
+                    path,
+                    root,
+                ]
+            )
+            == root
+        )
+
+    except ValueError:
+        return False
+
+
+ROOT, DB_PATH, LOGICAL_PREFIX = (
+    load_castillo_config()
+)
+
+
+def normalize_hashtag(value):
+    """
+    Misma normalización usada por Castillo al escribir hashtags:
+    - no almacena #
+    - minúsculas
+    - elimina diacríticos
+    - conserva letras/números Unicode
+    - puntuación/separadores -> guion
+    - máximo 64 caracteres
+    """
+    text = str(value or "").strip().lstrip("#")
+
+    if not text:
+        return ""
+
+    text = unicodedata.normalize(
+        "NFKD",
+        text,
+    )
+
+    pieces = []
+    separator = False
+
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+
+        if char.isalnum():
+            if (
+                separator
+                and pieces
+                and pieces[-1] != "-"
+            ):
+                pieces.append("-")
+
+            pieces.append(
+                char.lower()
+            )
+            separator = False
+
+        else:
+            separator = True
+
+    return "".join(
+        pieces
+    ).strip("-")[:64]
+
+
+def split_official_storage(value):
+    text = str(
+        value or ""
+    ).strip()
+
+    if not text:
+        return []
+
+    result = []
+    seen = set()
+
+    for part in text.split(";"):
+        tag = normalize_hashtag(
+            part
+        )
+
+        if (
+            not tag
+            or tag in seen
+        ):
+            continue
+
+        seen.add(
+            tag
+        )
+        result.append(
+            tag
+        )
+
+    return result
+
+
+def read_official_hashtags(raw):
+    tags_obj = getattr(
+        raw,
+        "tags",
+        None,
+    )
+
+    if tags_obj is None:
+        return []
+
+    try:
+        if isinstance(
+            tags_obj,
+            ID3,
+        ):
+            result = []
+
+            for frame in tags_obj.getall(
+                "TXXX"
+            ):
+                if (
+                    str(
+                        getattr(
+                            frame,
+                            "desc",
+                            "",
+                        )
+                    ).casefold()
+                    != CASTILLO_HASHTAGS_KEY.casefold()
+                ):
+                    continue
+
+                for value in (
+                    getattr(
+                        frame,
+                        "text",
+                        [],
+                    )
+                    or []
+                ):
+                    result.extend(
+                        split_official_storage(
+                            value
+                        )
+                    )
+
+            return unique_preserving_order(
+                result
+            )
+
+        if isinstance(
+            tags_obj,
+            MP4Tags,
+        ):
+            result = []
+
+            for value in tags_obj.get(
+                MP4_HASHTAGS_KEY,
+                [],
+            ):
+                if isinstance(
+                    value,
+                    bytes,
+                ):
+                    text = value.decode(
+                        "utf-8",
+                        errors="replace",
+                    )
+                else:
+                    text = str(
+                        value
+                    )
+
+                result.extend(
+                    split_official_storage(
+                        text
+                    )
+                )
+
+            return unique_preserving_order(
+                result
+            )
+
+        result = []
+
+        for key in tags_obj.keys():
+            if (
+                str(
+                    key
+                ).casefold()
+                != CASTILLO_HASHTAGS_KEY.casefold()
+            ):
+                continue
+
+            values = tags_obj.get(
+                key,
+                [],
+            )
+
+            if not isinstance(
+                values,
+                (list, tuple),
+            ):
+                values = [
+                    values
+                ]
+
+            for value in values:
+                result.extend(
+                    split_official_storage(
+                        value
+                    )
+                )
+
+        return unique_preserving_order(
+            result
+        )
+
+    except Exception:
+        return []
+
+
+def read_legacy_hashtags(raw):
+    """
+    Compatibilidad con metadata antigua encontrada en la biblioteca.
+
+    Ejemplo:
+        TXXX:0 = Power metal
+        TXXX:1 = heavy metal
+        TXXX:2 = metal
+
+    Solo se consideran claves TXXX cuyo descriptor sea completamente
+    numérico. No modifica ni migra el archivo: únicamente las indexa.
+    """
+    tags_obj = getattr(
+        raw,
+        "tags",
+        None,
+    )
+
+    if not isinstance(
+        tags_obj,
+        ID3,
+    ):
+        return []
+
+    result = []
+
+    try:
+        for frame in tags_obj.getall(
+            "TXXX"
+        ):
+            desc = str(
+                getattr(
+                    frame,
+                    "desc",
+                    "",
+                )
+            ).strip()
+
+            if not desc.isdigit():
+                continue
+
+            for value in (
+                getattr(
+                    frame,
+                    "text",
+                    [],
+                )
+                or []
+            ):
+                tag = normalize_hashtag(
+                    value
+                )
+
+                if tag:
+                    result.append(
+                        tag
+                    )
+
+    except Exception:
+        return []
+
+    return unique_preserving_order(
+        result
+    )
+
+
+def unique_preserving_order(values):
+    result = []
+    seen = set()
+
+    for value in values:
+        if (
+            not value
+            or value in seen
+        ):
+            continue
+
+        seen.add(
+            value
+        )
+        result.append(
+            value
+        )
+
+    return result
+
+
+def easy_value(easy, key):
+    if easy is None:
+        return ""
+
+    try:
+        values = easy.get(
+            key,
+            [],
+        )
+
+        if not values:
+            return ""
+
+        return str(
+            values[0]
+        ).strip()
+
+    except Exception:
+        return ""
+
+
+def resolve_audio(path):
+    real = os.path.realpath(
+        path
+    )
+
+    if (
+        not os.path.isfile(
+            real
+        )
+        or real == ROOT
+        or not path_inside_root(
+            real,
+            ROOT,
+        )
+    ):
+        fail(
+            "Archivo de audio no autorizado.",
+            10,
+        )
+
+    extension = os.path.splitext(
+        real
+    )[1].lower()
+
+    if (
+        extension
+        not in SUPPORTED_EXTENSIONS
+    ):
+        fail(
+            "Formato no indexable.",
+            11,
+        )
+
+    return real
+
+
+def logical_file(path):
+    relative = os.path.relpath(
+        path,
+        ROOT,
+    )
+
+    return (
+        LOGICAL_PREFIX
+        + relative.replace(
+            os.sep,
+            "/",
+        )
+    )
+
+
+def create_schema(connection):
+    connection.executescript(
+        """
+        PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = DELETE;
+        PRAGMA synchronous = FULL;
+
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS songs (
+            file TEXT PRIMARY KEY,
+            path TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            artist TEXT NOT NULL DEFAULT '',
+            album TEXT NOT NULL DEFAULT '',
+            albumartist TEXT NOT NULL DEFAULT '',
+            size INTEGER NOT NULL DEFAULT 0,
+            mtime_ns INTEGER NOT NULL DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS hashtags (
+            name TEXT PRIMARY KEY
+        );
+
+        CREATE TABLE IF NOT EXISTS song_hashtags (
+            file TEXT NOT NULL,
+            hashtag TEXT NOT NULL,
+            source TEXT NOT NULL
+                CHECK(source IN ('embedded', 'legacy')),
+            PRIMARY KEY (file, hashtag),
+            FOREIGN KEY (file)
+                REFERENCES songs(file)
+                ON DELETE CASCADE,
+            FOREIGN KEY (hashtag)
+                REFERENCES hashtags(name)
+                ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS
+            idx_song_hashtags_hashtag
+            ON song_hashtags(hashtag);
+
+        CREATE INDEX IF NOT EXISTS
+            idx_songs_artist
+            ON songs(artist);
+
+        CREATE INDEX IF NOT EXISTS
+            idx_songs_album
+            ON songs(album);
+        """
+    )
+
+
+def read_song(path, include_legacy=True):
+    try:
+        easy = File(
+            path,
+            easy=True,
+        )
+
+        raw = File(
+            path,
+            easy=False,
+        )
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error": str(
+                error
+            ),
+        }
+
+    if raw is None:
+        return {
+            "ok": False,
+            "error": "Formato no soportado por Mutagen.",
+        }
+
+    stat_info = os.stat(
+        path
+    )
+
+    official = read_official_hashtags(
+        raw
+    )
+
+    legacy = (
+        read_legacy_hashtags(
+            raw
+        )
+        if include_legacy
+        else []
+    )
+
+    official_set = set(
+        official
+    )
+
+    links = [
+        (
+            tag,
+            "embedded",
+        )
+        for tag in official
+    ]
+
+    for tag in legacy:
+        if tag in official_set:
+            continue
+
+        links.append(
+            (
+                tag,
+                "legacy",
+            )
+        )
+
+    return {
+        "ok": True,
+        "song": {
+            "file":
+                logical_file(
+                    path
+                ),
+            "path":
+                path,
+            "title":
+                easy_value(
+                    easy,
+                    "title",
+                ),
+            "artist":
+                easy_value(
+                    easy,
+                    "artist",
+                ),
+            "album":
+                easy_value(
+                    easy,
+                    "album",
+                ),
+            "albumartist":
+                easy_value(
+                    easy,
+                    "albumartist",
+                ),
+            "size":
+                int(
+                    stat_info.st_size
+                ),
+            "mtime_ns":
+                int(
+                    stat_info.st_mtime_ns
+                ),
+            "links":
+                links,
+        },
+    }
+
+
+def remove_orphan_hashtags(connection):
+    connection.execute(
+        """
+        DELETE FROM hashtags
+        WHERE name NOT IN (
+            SELECT DISTINCT hashtag
+            FROM song_hashtags
+        )
+        """
+    )
+
+
+def store_song(connection, song):
+    connection.execute(
+        """
+        INSERT INTO songs (
+            file,
+            path,
+            title,
+            artist,
+            album,
+            albumartist,
+            size,
+            mtime_ns
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(file) DO UPDATE SET
+            path = excluded.path,
+            title = excluded.title,
+            artist = excluded.artist,
+            album = excluded.album,
+            albumartist = excluded.albumartist,
+            size = excluded.size,
+            mtime_ns = excluded.mtime_ns
+        """,
+        (
+            song["file"],
+            song["path"],
+            song["title"],
+            song["artist"],
+            song["album"],
+            song["albumartist"],
+            song["size"],
+            song["mtime_ns"],
+        ),
+    )
+
+    connection.execute(
+        """
+        DELETE FROM song_hashtags
+        WHERE file = ?
+        """,
+        (
+            song["file"],
+        ),
+    )
+
+    for tag, source in song["links"]:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO hashtags (
+                name
+            )
+            VALUES (?)
+            """,
+            (
+                tag,
+            ),
+        )
+
+        connection.execute(
+            """
+            INSERT INTO song_hashtags (
+                file,
+                hashtag,
+                source
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(file, hashtag)
+            DO UPDATE SET
+                source = excluded.source
+            """,
+            (
+                song["file"],
+                tag,
+                source,
+            ),
+        )
+
+
+def iter_audio_files():
+    files = []
+
+    for directory, _, names in os.walk(
+        ROOT
+    ):
+        for name in names:
+            path = os.path.join(
+                directory,
+                name,
+            )
+
+            extension = os.path.splitext(
+                name
+            )[1].lower()
+
+            if (
+                extension
+                not in SUPPORTED_EXTENSIONS
+            ):
+                continue
+
+            files.append(
+                path
+            )
+
+    files.sort(
+        key=lambda value:
+            value.casefold()
+    )
+
+    return files
+
+
+def apply_permissions(path):
+    try:
+        group_id = grp.getgrnam(
+            "www-data"
+        ).gr_gid
+
+        if os.geteuid() == 0:
+            os.chown(
+                path,
+                0,
+                group_id,
+            )
+
+        os.chmod(
+            path,
+            0o664,
+        )
+
+    except Exception as error:
+        print(
+            "[Castillo hashtags] "
+            f"Aviso de permisos: {error}",
+            file=sys.stderr,
+        )
+
+
+def database_stats(connection):
+    def scalar(sql):
+        row = connection.execute(
+            sql
+        ).fetchone()
+
+        return int(
+            row[0]
+            if row
+            else 0
+        )
+
+    generated_row = connection.execute(
+        """
+        SELECT value
+        FROM meta
+        WHERE key = 'generated_at'
+        """
+    ).fetchone()
+
+    return {
+        "songs_indexed":
+            scalar(
+                "SELECT COUNT(*) FROM songs"
+            ),
+        "songs_with_hashtags":
+            scalar(
+                """
+                SELECT COUNT(
+                    DISTINCT file
+                )
+                FROM song_hashtags
+                """
+            ),
+        "hashtags":
+            scalar(
+                "SELECT COUNT(*) FROM hashtags"
+            ),
+        "links":
+            scalar(
+                "SELECT COUNT(*) FROM song_hashtags"
+            ),
+        "embedded_links":
+            scalar(
+                """
+                SELECT COUNT(*)
+                FROM song_hashtags
+                WHERE source = 'embedded'
+                """
+            ),
+        "legacy_links":
+            scalar(
+                """
+                SELECT COUNT(*)
+                FROM song_hashtags
+                WHERE source = 'legacy'
+                """
+            ),
+        "generated_at":
+            (
+                generated_row[0]
+                if generated_row
+                else None
+            ),
+    }
+
+
+def rebuild(include_legacy=True):
+    if not os.path.isdir(
+        ROOT
+    ):
+        fail(
+            "No existe la biblioteca local.",
+            20,
+        )
+
+    directory = os.path.dirname(
+        DB_PATH
+    )
+
+    os.makedirs(
+        directory,
+        exist_ok=True,
+    )
+
+    fd, temporary = tempfile.mkstemp(
+        prefix=".hashtags-",
+        suffix=".sqlite.tmp",
+        dir=directory,
+    )
+
+    os.close(
+        fd
+    )
+
+    files = iter_audio_files()
+
+    indexed = 0
+    failed = []
+
+    try:
+        connection = sqlite3.connect(
+            temporary
+        )
+
+        try:
+            create_schema(
+                connection
+            )
+
+            connection.execute(
+                "BEGIN"
+            )
+
+            for index, path in enumerate(
+                files,
+                start=1,
+            ):
+                result = read_song(
+                    path,
+                    include_legacy=include_legacy,
+                )
+
+                if not result["ok"]:
+                    failed.append({
+                        "file":
+                            logical_file(
+                                path
+                            ),
+                        "error":
+                            result["error"],
+                    })
+                    continue
+
+                store_song(
+                    connection,
+                    result["song"],
+                )
+
+                indexed += 1
+
+                if (
+                    index % 250 == 0
+                    or index == len(files)
+                ):
+                    print(
+                        "[Castillo hashtags] "
+                        f"{index}/{len(files)} archivos analizados",
+                        file=sys.stderr,
+                    )
+
+            remove_orphan_hashtags(
+                connection
+            )
+
+            generated_at = time.strftime(
+                "%Y-%m-%dT%H:%M:%S%z"
+            )
+
+            connection.execute(
+                """
+                INSERT INTO meta (
+                    key,
+                    value
+                )
+                VALUES ('schema_version', '1')
+                ON CONFLICT(key)
+                DO UPDATE SET
+                    value = excluded.value
+                """
+            )
+
+            connection.execute(
+                """
+                INSERT INTO meta (
+                    key,
+                    value
+                )
+                VALUES ('generated_at', ?)
+                ON CONFLICT(key)
+                DO UPDATE SET
+                    value = excluded.value
+                """,
+                (
+                    generated_at,
+                ),
+            )
+
+            connection.commit()
+
+            stats = database_stats(
+                connection
+            )
+
+        finally:
+            connection.close()
+
+        with open(
+            temporary,
+            "rb",
+        ) as handle:
+            os.fsync(
+                handle.fileno()
+            )
+
+        apply_permissions(
+            temporary
+        )
+
+        os.replace(
+            temporary,
+            DB_PATH,
+        )
+
+        apply_permissions(
+            DB_PATH
+        )
+
+        dir_fd = os.open(
+            directory,
+            os.O_RDONLY,
+        )
+
+        try:
+            os.fsync(
+                dir_fd
+            )
+        finally:
+            os.close(
+                dir_fd
+            )
+
+    except Exception:
+        if os.path.exists(
+            temporary
+        ):
+            os.unlink(
+                temporary
+            )
+
+        raise
+
+    return {
+        "ok": True,
+        "database":
+            DB_PATH,
+        "audio_files_found":
+            len(
+                files
+            ),
+        "indexed":
+            indexed,
+        "failed_count":
+            len(
+                failed
+            ),
+        "failed":
+            failed[:50],
+        "stats":
+            stats,
+        "legacy_enabled":
+            include_legacy,
+    }
+
+
+def open_database():
+    if not os.path.isfile(
+        DB_PATH
+    ):
+        fail(
+            "El índice todavía no existe. Ejecuta --rebuild.",
+            30,
+        )
+
+    connection = sqlite3.connect(
+        DB_PATH
+    )
+
+    connection.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+
+    return connection
+
+
+def update_audio(path, include_legacy=True):
+    audio = resolve_audio(
+        path
+    )
+
+    result = read_song(
+        audio,
+        include_legacy=include_legacy,
+    )
+
+    if not result["ok"]:
+        fail(
+            result["error"],
+            31,
+        )
+
+    connection = open_database()
+
+    try:
+        create_schema(
+            connection
+        )
+
+        with connection:
+            store_song(
+                connection,
+                result["song"],
+            )
+
+            remove_orphan_hashtags(
+                connection
+            )
+
+            connection.execute(
+                """
+                INSERT INTO meta (
+                    key,
+                    value
+                )
+                VALUES ('generated_at', ?)
+                ON CONFLICT(key)
+                DO UPDATE SET
+                    value = excluded.value
+                """,
+                (
+                    time.strftime(
+                        "%Y-%m-%dT%H:%M:%S%z"
+                    ),
+                ),
+            )
+
+        stats = database_stats(
+            connection
+        )
+
+    finally:
+        connection.close()
+
+    apply_permissions(
+        DB_PATH
+    )
+
+    return {
+        "ok": True,
+        "updated":
+            result["song"]["file"],
+        "hashtags": [
+            {
+                "name":
+                    tag,
+                "source":
+                    source,
+            }
+            for tag, source
+            in result["song"]["links"]
+        ],
+        "stats":
+            stats,
+    }
+
+
+def remove_audio(path):
+    audio = os.path.realpath(
+        path
+    )
+
+    if (
+        audio == ROOT
+        or not path_inside_root(
+            audio,
+            ROOT,
+        )
+    ):
+        fail(
+            "Archivo fuera de la biblioteca local.",
+            40,
+        )
+
+    logical = logical_file(
+        audio
+    )
+
+    connection = open_database()
+
+    try:
+        with connection:
+            connection.execute(
+                """
+                DELETE FROM songs
+                WHERE file = ?
+                """,
+                (
+                    logical,
+                ),
+            )
+
+            remove_orphan_hashtags(
+                connection
+            )
+
+        stats = database_stats(
+            connection
+        )
+
+    finally:
+        connection.close()
+
+    return {
+        "ok": True,
+        "removed":
+            logical,
+        "stats":
+            stats,
+    }
+
+
+def status():
+    connection = open_database()
+
+    try:
+        stats = database_stats(
+            connection
+        )
+
+    finally:
+        connection.close()
+
+    return {
+        "ok": True,
+        "database":
+            DB_PATH,
+        "stats":
+            stats,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=
+            "Índice reconstruible de hashtags de Castillo Player."
+    )
+
+    action = parser.add_mutually_exclusive_group(
+        required=True
+    )
+
+    action.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Reconstruye todo el índice desde los archivos de audio.",
+    )
+
+    action.add_argument(
+        "--status",
+        action="store_true",
+        help="Muestra estadísticas del índice actual.",
+    )
+
+    action.add_argument(
+        "--update-audio",
+        metavar="PATH",
+        help="Actualiza un solo archivo dentro del índice.",
+    )
+
+    action.add_argument(
+        "--remove-audio",
+        metavar="PATH",
+        help="Elimina un archivo del índice.",
+    )
+
+    parser.add_argument(
+        "--no-legacy",
+        action="store_true",
+        help=
+            "No indexa TXXX numéricos antiguos como hashtags heredados.",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        if args.rebuild:
+            result = rebuild(
+                include_legacy=
+                    not args.no_legacy
+            )
+
+        elif args.status:
+            result = status()
+
+        elif args.update_audio:
+            result = update_audio(
+                args.update_audio,
+                include_legacy=
+                    not args.no_legacy
+            )
+
+        else:
+            result = remove_audio(
+                args.remove_audio
+            )
+
+    except Exception as error:
+        fail(
+            str(
+                error
+            ),
+            99,
+        )
+
+    print(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

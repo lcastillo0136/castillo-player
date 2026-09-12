@@ -1,0 +1,985 @@
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+
+CONFIG_FILE="/etc/castillo-player/castillo.ini"
+
+STATE_DIR="/var/lib/nas-music-sync"
+LAST_EPOCH="${STATE_DIR}/last_success_epoch"
+LAST_HUMAN="${STATE_DIR}/last_success"
+
+RUNTIME_DIR="/run/nas-music-sync"
+EXCLUDE_FILE="${RUNTIME_DIR}/pending-excludes.txt"
+
+# 7 días
+WEEK_SECONDS=604800
+
+# Reservar al menos 10 GiB libres
+# en el almacenamiento local.
+MIN_FREE_KB=$((10 * 1024 * 1024))
+
+
+fail_config() {
+    echo "ERROR: $1" >&2
+    exit "${2:-1}"
+}
+
+
+validate_config_file() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        fail_config \
+            "No existe la configuración de Castillo Player." \
+            3
+    fi
+
+
+    local owner_uid
+    local mode
+
+
+    owner_uid="$(
+        stat -c '%u' "$CONFIG_FILE"
+    )"
+
+
+    mode="$(
+        stat -c '%a' "$CONFIG_FILE"
+    )"
+
+
+    if [[ "$owner_uid" != "0" ]]; then
+        fail_config \
+            "La configuración de Castillo Player debe pertenecer a root." \
+            4
+    fi
+
+
+    if (( (8#$mode & 0022) != 0 )); then
+        fail_config \
+            "La configuración de Castillo Player no puede ser escribible por grupo u otros usuarios." \
+            5
+    fi
+}
+
+
+read_config_value() {
+    local section="$1"
+    local key="$2"
+
+
+    python3 - \
+        "$CONFIG_FILE" \
+        "$section" \
+        "$key" \
+        <<'PYCONFIG'
+import configparser
+import sys
+
+
+config_file = sys.argv[1]
+section = sys.argv[2]
+key = sys.argv[3]
+
+
+parser = configparser.ConfigParser(
+    interpolation=None
+)
+
+
+try:
+    loaded = parser.read(
+        config_file,
+        encoding="utf-8",
+    )
+
+except (
+    configparser.Error,
+    OSError,
+):
+    raise SystemExit(20)
+
+
+if not loaded:
+    raise SystemExit(20)
+
+
+try:
+    value = str(
+        parser[section][key]
+    ).strip()
+
+except KeyError:
+    raise SystemExit(21)
+
+
+if (
+    len(value) >= 2
+    and value[0] == value[-1]
+    and value[0] in ('"', "'")
+):
+    value = value[1:-1].strip()
+
+
+if (
+    not value
+    or "\x00" in value
+    or "\n" in value
+    or "\r" in value
+):
+    raise SystemExit(22)
+
+
+print(
+    value,
+    end=""
+)
+PYCONFIG
+}
+
+
+validate_config_file
+
+
+NAS_ENABLED="$(
+    read_config_value \
+        "nas" \
+        "enabled"
+)" || fail_config \
+    "No fue posible leer nas.enabled." \
+    6
+
+
+case "${NAS_ENABLED,,}" in
+
+    1|true|yes|on)
+        ;;
+
+    0|false|no|off)
+        echo "El módulo NAS está deshabilitado."
+        exit 0
+        ;;
+
+    *)
+        fail_config \
+            "Valor inválido para nas.enabled." \
+            6
+        ;;
+
+esac
+
+
+SOURCE_ROOT="$(
+    read_config_value \
+        "nas" \
+        "readonly_root"
+)" || fail_config \
+    "No fue posible leer nas.readonly_root." \
+    6
+
+
+DEST_ROOT="$(
+    read_config_value \
+        "core" \
+        "library_root"
+)" || fail_config \
+    "No fue posible leer core.library_root." \
+    6
+
+
+CASTILLO_STATE_DIR="$(
+    read_config_value \
+        "core" \
+        "state_dir"
+)" || fail_config \
+    "No fue posible leer core.state_dir." \
+    6
+
+
+if [[
+    "$SOURCE_ROOT" != /*
+    || "$DEST_ROOT" != /*
+    || "$CASTILLO_STATE_DIR" != /*
+]]; then
+    fail_config \
+        "Las rutas configuradas deben ser absolutas." \
+        7
+fi
+
+
+if [[
+    "$SOURCE_ROOT" == "/"
+    || "$DEST_ROOT" == "/"
+    || "$CASTILLO_STATE_DIR" == "/"
+]]; then
+    fail_config \
+        "Una ruta configurada no puede ser la raíz del sistema." \
+        7
+fi
+
+
+SOURCE="${SOURCE_ROOT%/}/"
+DEST="${DEST_ROOT%/}/"
+
+PENDING_FILE="${CASTILLO_STATE_DIR%/}/pending-changes.json"
+
+
+FORCE=0
+DRY_RUN=0
+
+
+for ARG in "$@"; do
+
+    case "$ARG" in
+
+        --force)
+            FORCE=1
+            ;;
+
+        --dry-run)
+            DRY_RUN=1
+            ;;
+
+        *)
+            echo "ERROR: argumento desconocido: $ARG"
+            echo
+            echo "Uso:"
+            echo "  nas-music-sync [--force] [--dry-run]"
+            exit 2
+            ;;
+
+    esac
+
+done
+
+
+#
+# Evitar dos sincronizaciones simultáneas.
+#
+# Este mismo lock también es utilizado por
+# castillo-pending-sync para impedir que
+# NAS -> local y local -> NAS trabajen al
+# mismo tiempo.
+#
+exec 9>/run/nas-music-sync.lock
+
+
+if ! flock -n 9; then
+    echo "Ya hay una sincronización en ejecución."
+    exit 0
+fi
+
+
+mkdir -p "$STATE_DIR"
+mkdir -p "$RUNTIME_DIR"
+
+chmod 755 "$RUNTIME_DIR"
+
+
+cleanup() {
+    rm -f "$EXCLUDE_FILE"
+}
+
+
+trap cleanup EXIT
+
+
+NOW=$(date +%s)
+
+
+#
+# Comprobar si ya pasó el intervalo.
+#
+# --force ignora solamente este intervalo.
+#
+if [[
+    "$FORCE" -eq 0
+    && "$DRY_RUN" -eq 0
+    && -f "$LAST_EPOCH"
+]]; then
+
+    LAST="$(
+        cat "$LAST_EPOCH" \
+            2>/dev/null \
+            || echo 0
+    )"
+
+
+    if [[ "$LAST" =~ ^[0-9]+$ ]]; then
+
+        AGE=$((NOW - LAST))
+
+
+        if (( AGE < WEEK_SECONDS )); then
+
+            REMAINING=$((WEEK_SECONDS - AGE))
+            DAYS=$((REMAINING / 86400))
+            HOURS=$(((REMAINING % 86400) / 3600))
+
+
+            echo "Todavía no corresponde sincronizar."
+            echo \
+                "Faltan aproximadamente ${DAYS} días y ${HOURS} horas."
+
+            exit 0
+
+        fi
+
+    fi
+
+fi
+
+
+echo "========================================"
+
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "Sincronización NAS -> biblioteca local (DRY RUN)"
+else
+    echo "Sincronización NAS -> biblioteca local"
+fi
+
+
+echo "Inicio: $(date --iso-8601=seconds)"
+echo "========================================"
+
+
+#
+# Asegurarse de que el NAS configurado
+# realmente esté montado.
+#
+if [[ ! -d "${SOURCE%/}" ]] || \
+   ! mountpoint -q "${SOURCE%/}"; then
+
+    echo \
+        "ERROR: El NAS no está montado en ${SOURCE%/}"
+
+    exit 10
+
+fi
+
+
+#
+# La biblioteca local debe existir.
+#
+# No la creamos automáticamente aquí.
+#
+# Si el almacenamiento local desapareció,
+# crear esa ruta sobre el sistema raíz sería
+# peligroso con un rsync que utiliza --delete.
+#
+if [[ ! -d "${DEST%/}" ]]; then
+
+    echo \
+        "ERROR: La biblioteca local configurada no existe: ${DEST%/}"
+
+    exit 11
+
+fi
+
+
+#
+# Confirmar que la biblioteca local está
+# realmente sobre un montaje independiente.
+#
+# Esto evita escribir accidentalmente en la
+# tarjeta del sistema si el almacenamiento
+# local no está montado.
+#
+if ! command -v findmnt >/dev/null 2>&1; then
+    echo "ERROR: No se encontró findmnt."
+    exit 11
+fi
+
+
+LOCAL_MOUNT="$(
+    findmnt \
+        -n \
+        -o TARGET \
+        --target "${DEST%/}" \
+        2>/dev/null |
+        head -n 1
+)"
+
+
+if [[
+    -z "$LOCAL_MOUNT"
+    || "$LOCAL_MOUNT" == "/"
+]]; then
+
+    echo \
+        "ERROR: La biblioteca local no está sobre un almacenamiento montado independiente."
+
+    exit 11
+
+fi
+
+
+#
+# Resolver las rutas reales para impedir
+# configuraciones peligrosas.
+#
+SOURCE_REAL="$(
+    realpath -e "${SOURCE%/}"
+)" || {
+    echo \
+        "ERROR: No fue posible resolver el origen NAS."
+
+    exit 11
+}
+
+
+DEST_REAL="$(
+    realpath -e "${DEST%/}"
+)" || {
+    echo \
+        "ERROR: No fue posible resolver la biblioteca local."
+
+    exit 11
+}
+
+
+if [[ "$SOURCE_REAL" == "$DEST_REAL" ]]; then
+
+    echo \
+        "ERROR: Origen y destino no pueden ser iguales."
+
+    exit 11
+
+fi
+
+
+case "$DEST_REAL/" in
+
+    "$SOURCE_REAL/"*)
+        echo \
+            "ERROR: El destino no puede estar dentro del origen."
+
+        exit 11
+        ;;
+
+esac
+
+
+case "$SOURCE_REAL/" in
+
+    "$DEST_REAL/"*)
+        echo \
+            "ERROR: El origen no puede estar dentro del destino."
+
+        exit 11
+        ;;
+
+esac
+
+
+#
+# Protección contra almacenamiento local
+# demasiado lleno.
+#
+FREE_KB="$(
+    df -Pk "${DEST%/}" |
+        awk 'NR==2 {print $4}'
+)"
+
+
+if ! [[ "$FREE_KB" =~ ^[0-9]+$ ]]; then
+
+    echo \
+        "ERROR: No fue posible determinar el espacio libre del almacenamiento local."
+
+    exit 12
+
+fi
+
+
+if (( FREE_KB < MIN_FREE_KB )); then
+
+    echo \
+        "ERROR: Quedan menos de 10 GiB libres en el almacenamiento local."
+
+    exit 13
+
+fi
+
+
+#
+# Generar lista de exclusión basada en los
+# cambios locales pendientes.
+#
+# Un archivo excluido:
+#
+#   - NO se sobrescribe desde el NAS
+#   - NO se elimina mediante --delete
+#
+# Las rutas se anclan a la raíz de la
+# biblioteca transferida.
+#
+# Si pending-changes.json existe pero está
+# corrupto o tiene un formato inesperado,
+# ABORTAMOS. Es más seguro no sincronizar
+# que arriesgar una edición local.
+#
+PENDING_COUNT="$(
+    python3 - \
+        "$PENDING_FILE" \
+        "$EXCLUDE_FILE" \
+        <<'PY'
+import json
+import os
+import sys
+
+
+pending_file = sys.argv[1]
+exclude_file = sys.argv[2]
+
+
+def fail(message):
+    print(
+        "ERROR: " + message,
+        file=sys.stderr
+    )
+
+    raise SystemExit(1)
+
+
+def validate_relative(value):
+    if not isinstance(
+        value,
+        str
+    ):
+        fail(
+            "Se encontró una ruta pendiente "
+            "que no es texto."
+        )
+
+
+    value = value.strip()
+
+
+    if not value:
+        fail(
+            "Se encontró una ruta pendiente vacía."
+        )
+
+
+    if "\x00" in value:
+        fail(
+            "Se encontró una ruta pendiente inválida."
+        )
+
+
+    if value.startswith("/"):
+        fail(
+            "Se encontró una ruta pendiente absoluta."
+        )
+
+
+    parts = value.split("/")
+
+
+    if any(
+        part in (
+            "",
+            ".",
+            "..",
+        )
+        for part in parts
+    ):
+        fail(
+            "Se encontró una ruta pendiente "
+            "no autorizada: " + value
+        )
+
+
+    return "/".join(
+        parts
+    )
+
+
+def rsync_escape(value):
+    #
+    # Los patrones de exclude de rsync
+    # interpretan *, ?, [ y \.
+    #
+    # Los escapamos para que el nombre se
+    # trate literalmente.
+    #
+    value = value.replace(
+        "\\",
+        "\\\\"
+    )
+
+    value = value.replace(
+        "*",
+        "\\*"
+    )
+
+    value = value.replace(
+        "?",
+        "\\?"
+    )
+
+    value = value.replace(
+        "[",
+        "\\["
+    )
+
+
+    return value
+
+
+paths = []
+
+
+if os.path.isfile(
+    pending_file
+):
+    try:
+        with open(
+            pending_file,
+            "r",
+            encoding="utf-8"
+        ) as handle:
+
+            state = json.load(
+                handle
+            )
+
+    except Exception as error:
+        fail(
+            "No fue posible leer "
+            "pending-changes.json: "
+            + str(error)
+        )
+
+
+    if not isinstance(
+        state,
+        dict
+    ):
+        fail(
+            "pending-changes.json "
+            "no contiene un objeto válido."
+        )
+
+
+    items = state.get(
+        "items",
+        {}
+    )
+
+
+    if isinstance(
+        items,
+        dict
+    ):
+        iterable = []
+
+
+        for key, item in items.items():
+
+            if not isinstance(
+                item,
+                dict
+            ):
+                fail(
+                    "Hay un pendiente con "
+                    "formato inválido."
+                )
+
+
+            relative = item.get(
+                "relative_path",
+                key
+            )
+
+
+            iterable.append(
+                relative
+            )
+
+
+    elif isinstance(
+        items,
+        list
+    ):
+        iterable = []
+
+
+        for item in items:
+
+            if not isinstance(
+                item,
+                dict
+            ):
+                fail(
+                    "Hay un pendiente con "
+                    "formato inválido."
+                )
+
+
+            if "relative_path" not in item:
+                fail(
+                    "Hay un pendiente sin "
+                    "relative_path."
+                )
+
+
+            iterable.append(
+                item["relative_path"]
+            )
+
+
+    else:
+        fail(
+            "El campo items de "
+            "pending-changes.json "
+            "no es válido."
+        )
+
+
+    for value in iterable:
+
+        paths.append(
+            validate_relative(
+                value
+            )
+        )
+
+
+#
+# Eliminar duplicados manteniendo
+# un orden determinista.
+#
+paths = sorted(
+    set(paths)
+)
+
+
+directory = os.path.dirname(
+    exclude_file
+)
+
+
+os.makedirs(
+    directory,
+    exist_ok=True
+)
+
+
+with open(
+    exclude_file,
+    "w",
+    encoding="utf-8",
+    newline="\n"
+) as handle:
+
+    for relative in paths:
+
+        #
+        # La "/" inicial ancla la regla
+        # a la raíz del SOURCE de rsync.
+        #
+        handle.write(
+            "/"
+            + rsync_escape(
+                relative
+            )
+            + "\n"
+        )
+
+
+print(
+    len(paths)
+)
+PY
+)"
+
+PENDING_STATUS=$?
+
+
+if (( PENDING_STATUS != 0 )); then
+
+    echo \
+        "ERROR: No fue posible generar la protección de cambios pendientes."
+
+    exit 20
+
+fi
+
+
+if ! [[ "$PENDING_COUNT" =~ ^[0-9]+$ ]]; then
+
+    echo \
+        "ERROR: Respuesta inválida al generar las exclusiones."
+
+    exit 21
+
+fi
+
+
+echo
+echo "Origen : $SOURCE"
+echo "Destino: $DEST"
+echo
+
+
+if (( PENDING_COUNT > 0 )); then
+
+    echo \
+        "Protección de cambios locales activa."
+
+    echo \
+        "Archivos pendientes protegidos: $PENDING_COUNT"
+
+    echo
+
+
+    while IFS= read -r RULE; do
+
+        [[ -z "$RULE" ]] && continue
+
+
+        printf \
+            '  PROTEGIDO: %s\n' \
+            "${RULE#/}"
+
+    done < "$EXCLUDE_FILE"
+
+
+else
+
+    echo \
+        "No hay cambios locales pendientes que proteger."
+
+    echo
+
+fi
+
+
+#
+# Copia incremental NAS -> biblioteca local:
+#
+# - crea archivos nuevos
+# - actualiza archivos modificados
+# - incluye .lrc, imágenes y demás contenido
+# - elimina localmente archivos ausentes en NAS
+#
+# EXCEPCIÓN:
+#
+# Los archivos registrados como pendientes
+# están en EXCLUDE_FILE y por tanto rsync no
+# puede sobrescribirlos ni eliminarlos.
+#
+RSYNC_ARGS=(
+    -rt
+    --partial
+    --delete
+    --delete-delay
+    --human-readable
+    --info=name1,stats2
+    --exclude-from="$EXCLUDE_FILE"
+)
+
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+
+    RSYNC_ARGS+=(
+        --dry-run
+        --itemize-changes
+    )
+
+fi
+
+
+rsync \
+    "${RSYNC_ARGS[@]}" \
+    "$SOURCE" \
+    "$DEST"
+
+RSYNC_STATUS=$?
+
+
+if (( RSYNC_STATUS != 0 )); then
+
+    echo
+    echo \
+        "ERROR: rsync terminó con código $RSYNC_STATUS"
+
+    echo \
+        "No se actualizará la fecha de última sincronización."
+
+    exit "$RSYNC_STATUS"
+
+fi
+
+
+#
+# Un dry-run termina aquí.
+#
+# No modifica:
+#
+# - last_success_epoch
+# - last_success
+# - biblioteca MPD
+#
+if [[ "$DRY_RUN" -eq 1 ]]; then
+
+    echo
+    echo \
+        "DRY RUN completado correctamente."
+
+    echo \
+        "No se modificó ningún archivo."
+
+    echo \
+        "No se actualizó la fecha de última sincronización."
+
+    exit 0
+
+fi
+
+
+sync
+
+
+#
+# Guardar la fecha SOLO después de una
+# sincronización real y exitosa.
+#
+date +%s \
+    > "$LAST_EPOCH"
+
+date --iso-8601=seconds \
+    > "$LAST_HUMAN"
+
+
+echo
+echo \
+    "Sincronización completada correctamente."
+
+echo \
+    "Última actualización: $(cat "$LAST_HUMAN")"
+
+
+#
+# Pedir a MPD/moOde que actualice
+# su biblioteca.
+#
+if command -v mpc >/dev/null 2>&1; then
+
+    echo \
+        "Actualizando biblioteca MPD..."
+
+
+    mpc update \
+        >/dev/null \
+        2>&1 \
+        || echo \
+            "Aviso: la sincronización terminó bien, pero MPD no pudo actualizarse automáticamente."
+
+fi
+
+
+exit 0

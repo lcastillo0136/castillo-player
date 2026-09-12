@@ -1,0 +1,235 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+
+CONFIG_FILE="/etc/castillo-player/castillo.ini"
+
+PHP="/usr/bin/php"
+BLUETOOTHCTL="/usr/bin/bluetoothctl"
+
+
+fail() {
+    echo "$1" >&2
+    exit "${2:-1}"
+}
+
+
+usage() {
+    echo \
+        "Usage: castillo-audio-output local|bluetooth <MAC>" \
+        >&2
+
+    exit 2
+}
+
+
+validate_config_file() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        fail \
+            "Castillo Player configuration not found" \
+            3
+    fi
+
+
+    local owner_uid
+    local mode
+
+
+    owner_uid="$(
+        stat -c '%u' "$CONFIG_FILE"
+    )"
+
+    mode="$(
+        stat -c '%a' "$CONFIG_FILE"
+    )"
+
+
+    if [[ "$owner_uid" != "0" ]]; then
+        fail \
+            "Castillo Player configuration must be owned by root" \
+            4
+    fi
+
+
+    if (( (8#$mode & 0022) != 0 )); then
+        fail \
+            "Castillo Player configuration must not be writable by group or others" \
+            5
+    fi
+}
+
+
+read_config_value() {
+    local section="$1"
+    local key="$2"
+
+
+    "$PHP" -r '
+        $file = $argv[1];
+        $section = $argv[2];
+        $key = $argv[3];
+
+        $config = @parse_ini_file(
+            $file,
+            true,
+            INI_SCANNER_RAW
+        );
+
+        if (
+            !is_array($config) ||
+            !isset($config[$section]) ||
+            !is_array($config[$section]) ||
+            !array_key_exists(
+                $key,
+                $config[$section]
+            )
+        ) {
+            exit(20);
+        }
+
+        $value = trim(
+            (string) $config[$section][$key]
+        );
+
+        if ($value === "") {
+            exit(21);
+        }
+
+        echo $value;
+    ' \
+        "$CONFIG_FILE" \
+        "$section" \
+        "$key"
+}
+
+
+is_valid_mac() {
+    [[ "$1" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]]
+}
+
+
+is_paired() {
+    "$BLUETOOTHCTL" devices Paired |
+        grep -Fqi "Device $1 "
+}
+
+
+is_audio_sink() {
+    "$BLUETOOTHCTL" info "$1" \
+        2>/dev/null |
+        grep -Fqi \
+            "0000110b-0000-1000-8000-00805f9b34fb"
+}
+
+
+if [[ ! -x "$PHP" ]]; then
+    fail \
+        "PHP executable not found" \
+        6
+fi
+
+
+if [[ ! -x "$BLUETOOTHCTL" ]]; then
+    fail \
+        "bluetoothctl executable not found" \
+        7
+fi
+
+
+validate_config_file
+
+
+MOODE_SCRIPT="$(
+    read_config_value \
+        "moode" \
+        "btaudio_script"
+)" || fail \
+    "Invalid or missing moode.btaudio_script configuration" \
+    8
+
+
+if [[ "$MOODE_SCRIPT" != /* ]]; then
+    fail \
+        "moode.btaudio_script must be an absolute path" \
+        9
+fi
+
+
+if [[ ! -f "$MOODE_SCRIPT" ]]; then
+    fail \
+        "moOde set-btaudio.php was not found" \
+        10
+fi
+
+
+ACTION="${1:-}"
+
+
+case "$ACTION" in
+
+    local)
+
+        exec \
+            "$PHP" \
+            "$MOODE_SCRIPT" \
+            --local
+        ;;
+
+
+    bluetooth)
+
+        MAC="${2:-}"
+        MAC="${MAC^^}"
+
+
+        if ! is_valid_mac "$MAC"; then
+            fail \
+                "Invalid Bluetooth MAC address" \
+                11
+        fi
+
+
+        if ! is_paired "$MAC"; then
+            fail \
+                "Bluetooth device is not paired" \
+                12
+        fi
+
+
+        if ! is_audio_sink "$MAC"; then
+            fail \
+                "Bluetooth device is not an Audio Sink" \
+                13
+        fi
+
+
+        #
+        # set-btaudio.php no cambia el MAC cuando
+        # moOde ya está en modo Bluetooth.
+        #
+        # Pasar primero por Local garantiza que
+        # btstream.conf se actualice al nuevo dispositivo.
+        #
+
+        "$PHP" \
+            "$MOODE_SCRIPT" \
+            --local \
+            >/dev/null 2>&1 \
+            || true
+
+
+        exec \
+            "$PHP" \
+            "$MOODE_SCRIPT" \
+            --btspeaker \
+            "$MAC"
+        ;;
+
+
+    *)
+
+        usage
+        ;;
+
+esac

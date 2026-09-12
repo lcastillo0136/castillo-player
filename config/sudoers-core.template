@@ -1,0 +1,5 @@
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-audio-output local
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-audio-output bluetooth *
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-cover-save
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-lrc-save
+www-data ALL=(root) NOPASSWD: /usr/local/sbin/castillo-tags-save

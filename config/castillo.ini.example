@@ -1,0 +1,42 @@
+[core]
+install_dir = "/opt/castillo-player"
+
+; Physical path to the local music library.
+; Example:
+; /media/MUSIC_DRIVE/Music
+library_root = "/media/MUSIC_DRIVE/Music"
+
+; MPD path corresponding to library_root.
+; It must end with "/".
+; Example:
+; USB/MUSIC_DRIVE/Music/
+library_mpd_prefix = "USB/MUSIC_DRIVE/Music/"
+
+state_dir = "/var/lib/castillo-player"
+helper_dir = "/usr/local/sbin"
+
+
+[mpd]
+host = "127.0.0.1"
+port = 6600
+
+
+[moode]
+www_root = "/var/www"
+btaudio_script = "/var/www/util/set-btaudio.php"
+db_path = "/var/local/www/db/moode-sqlite3.db"
+
+
+[nas]
+; Optional NAS synchronization module.
+; Leave false if NAS synchronization is not used.
+enabled = false
+
+; Name of the NAS source configured in moOde.
+source_name = "YOUR_NAS_SOURCE"
+
+; Existing read-only NAS mount used for NAS -> local synchronization.
+readonly_root = "/mnt/NAS/Music"
+
+; Temporary/read-write mount point used for local -> NAS synchronization.
+readwrite_root = "/mnt/NAS/Music_RW"

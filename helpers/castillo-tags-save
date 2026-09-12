@@ -1,0 +1,1038 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unicodedata
+
+from mutagen import File
+from mutagen.easyid3 import EasyID3
+from mutagen.easymp4 import EasyMP4Tags
+from mutagen.id3 import COMM, ID3, TXXX
+from mutagen.mp4 import AtomDataType, MP4FreeForm, MP4Tags
+
+
+CONFIG_FILE = "/etc/castillo-player/castillo.ini"
+
+
+def fail(message, code=1):
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": message,
+            },
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
+    sys.exit(code)
+
+
+def clean_ini_value(value):
+    value = value.strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        value = value[1:-1].strip()
+
+    return value
+
+
+def load_castillo_paths():
+    if not os.path.isfile(
+        CONFIG_FILE
+    ):
+        fail(
+            "No existe la configuración de Castillo Player.",
+            2,
+        )
+
+    parser = configparser.ConfigParser(
+        interpolation=None
+    )
+
+    try:
+        loaded = parser.read(
+            CONFIG_FILE,
+            encoding="utf-8",
+        )
+
+    except (
+        configparser.Error,
+        OSError,
+    ) as error:
+        fail(
+            f"No fue posible leer la configuración: {error}",
+            3,
+        )
+
+    if not loaded:
+        fail(
+            "No fue posible cargar la configuración de Castillo Player.",
+            3,
+        )
+
+    try:
+        library_root = clean_ini_value(
+            parser["core"]["library_root"]
+        )
+
+        helper_dir = clean_ini_value(
+            parser["core"]["helper_dir"]
+        )
+
+    except KeyError as error:
+        fail(
+            f"Falta configuración requerida: {error}",
+            4,
+        )
+
+    if (
+        not library_root
+        or not os.path.isabs(
+            library_root
+        )
+    ):
+        fail(
+            "library_root debe ser una ruta absoluta.",
+            5,
+        )
+
+    if (
+        not helper_dir
+        or not os.path.isabs(
+            helper_dir
+        )
+    ):
+        fail(
+            "helper_dir debe ser una ruta absoluta.",
+            6,
+        )
+
+    root = os.path.realpath(
+        library_root
+    )
+
+    helper_root = os.path.realpath(
+        helper_dir
+    )
+
+    if root == os.path.sep:
+        fail(
+            "library_root no puede ser la raíz del sistema.",
+            7,
+        )
+
+    if not os.path.isdir(
+        root
+    ):
+        fail(
+            "No existe la biblioteca configurada.",
+            8,
+        )
+
+    if not os.path.isdir(
+        helper_root
+    ):
+        fail(
+            "No existe helper_dir.",
+            9,
+        )
+
+    hashtags_index = os.path.join(
+        helper_root,
+        "castillo-hashtags-index",
+    )
+
+    return (
+        root,
+        hashtags_index,
+    )
+
+
+def path_inside_root(
+    path,
+    root,
+):
+    try:
+        return (
+            os.path.commonpath(
+                [
+                    path,
+                    root,
+                ]
+            )
+            == root
+        )
+
+    except ValueError:
+        return False
+
+
+def register_easy_tag_extensions():
+    """
+    Añade compatibilidad para campos que Mutagen EasyTags no
+    expone de forma uniforme entre MP3 y MP4/M4A.
+    """
+
+    def comment_get(id3, key):
+        values = []
+
+        for frame in id3.getall("COMM"):
+            for text in getattr(frame, "text", []) or []:
+                value = str(text).strip()
+
+                if value:
+                    values.append(value)
+
+        return values
+
+    def comment_set(id3, key, values):
+        id3.delall("COMM")
+
+        clean = [
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+        ]
+
+        if clean:
+            id3.add(
+                COMM(
+                    encoding=3,
+                    lang="eng",
+                    desc="",
+                    text=clean,
+                )
+            )
+
+    def comment_delete(id3, key):
+        id3.delall("COMM")
+
+    def comment_list(id3, key):
+        return ["comment"] if id3.getall("COMM") else []
+
+    EasyID3.RegisterKey(
+        "comment",
+        getter=comment_get,
+        setter=comment_set,
+        deleter=comment_delete,
+        lister=comment_list,
+    )
+
+    # Asegurar mapeos ID3 estándar.
+    EasyID3.RegisterTextKey("composer", "TCOM")
+    EasyID3.RegisterTextKey("bpm", "TBPM")
+
+    # ©wrt es el átomo MP4/M4A estándar para compositor.
+    EasyMP4Tags.RegisterTextKey("composer", "\xa9wrt")
+
+
+register_easy_tag_extensions()
+
+
+def synchsafe_to_int(raw):
+    if len(raw) != 4:
+        return None
+
+    if any(value & 0x80 for value in raw):
+        return None
+
+    return (
+        (raw[0] << 21)
+        | (raw[1] << 14)
+        | (raw[2] << 7)
+        | raw[3]
+    )
+
+
+def id3_block_size(data, offset):
+    if offset < 0 or offset + 10 > len(data):
+        return None
+
+    if data[offset : offset + 3] != b"ID3":
+        return None
+
+    major = data[offset + 3]
+    flags = data[offset + 5]
+
+    if major not in (2, 3, 4):
+        return None
+
+    payload_size = synchsafe_to_int(
+        data[offset + 6 : offset + 10]
+    )
+
+    if payload_size is None:
+        return None
+
+    total = 10 + payload_size
+
+    # ID3v2.4 puede incluir footer de 10 bytes.
+    if major == 4 and (flags & 0x10):
+        total += 10
+
+    if offset + total > len(data):
+        return None
+
+    return total
+
+
+def clean_duplicate_id3(path):
+    """
+    Conserva el primer bloque ID3v2 al inicio del MP3 y elimina
+    únicamente los bloques ID3v2 consecutivos inmediatamente
+    posteriores. No recodifica el audio.
+    """
+
+    if os.path.splitext(path)[1].lower() != ".mp3":
+        return {
+            "cleaned": False,
+            "duplicates": 0,
+            "bytes_removed": 0,
+        }
+
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except Exception as error:
+        fail(
+            f"No fue posible leer el MP3: {error}",
+            30,
+        )
+
+    first_size = id3_block_size(
+        data,
+        0,
+    )
+
+    if first_size is None:
+        return {
+            "cleaned": False,
+            "duplicates": 0,
+            "bytes_removed": 0,
+        }
+
+    cursor = first_size
+    duplicates = 0
+
+    while (
+        cursor + 10 <= len(data)
+        and data[cursor : cursor + 3] == b"ID3"
+    ):
+        size = id3_block_size(
+            data,
+            cursor,
+        )
+
+        if size is None:
+            break
+
+        duplicates += 1
+        cursor += size
+
+    if duplicates == 0:
+        return {
+            "cleaned": False,
+            "duplicates": 0,
+            "bytes_removed": 0,
+        }
+
+    bytes_removed = cursor - first_size
+
+    clean_data = (
+        data[:first_size]
+        + data[cursor:]
+    )
+
+    stat_info = os.stat(
+        path
+    )
+
+    directory = os.path.dirname(
+        path
+    )
+
+    fd, temporary = tempfile.mkstemp(
+        prefix=".castillo-id3-clean-",
+        suffix=".tmp",
+        dir=directory,
+    )
+
+    try:
+        with os.fdopen(
+            fd,
+            "wb",
+        ) as handle:
+            handle.write(
+                clean_data
+            )
+
+            handle.flush()
+            os.fsync(
+                handle.fileno()
+            )
+
+        os.chown(
+            temporary,
+            stat_info.st_uid,
+            stat_info.st_gid,
+        )
+
+        os.chmod(
+            temporary,
+            stat_info.st_mode & 0o777,
+        )
+
+        os.replace(
+            temporary,
+            path,
+        )
+
+        dir_fd = os.open(
+            directory,
+            os.O_RDONLY,
+        )
+
+        try:
+            os.fsync(
+                dir_fd
+            )
+        finally:
+            os.close(
+                dir_fd
+            )
+
+    except Exception as error:
+        fail(
+            f"No fue posible limpiar ID3 duplicados: {error}",
+            31,
+        )
+
+    finally:
+        if os.path.exists(
+            temporary
+        ):
+            os.unlink(
+                temporary
+            )
+
+    return {
+        "cleaned": True,
+        "duplicates": duplicates,
+        "bytes_removed": bytes_removed,
+    }
+
+
+def clean_value(payload, key, max_length=4000):
+    value = payload.get(
+        key,
+        "",
+    )
+
+    if value is None:
+        value = ""
+
+    if not isinstance(
+        value,
+        str,
+    ):
+        value = str(
+            value
+        )
+
+    value = value.strip()
+
+    if len(value) > max_length:
+        fail(
+            f"Valor demasiado largo: {key}",
+            13,
+        )
+
+    return value
+
+
+def combine_number(number, total):
+    number = number.strip()
+    total = total.strip()
+
+    if number and total:
+        return f"{number}/{total}"
+
+    if number:
+        return number
+
+    if total:
+        return f"0/{total}"
+
+    return ""
+
+
+CASTILLO_HASHTAGS_KEY = "CASTILLO_HASHTAGS"
+MP4_HASHTAGS_KEY = "----:com.apple.iTunes:CASTILLO_HASHTAGS"
+
+
+def normalize_hashtag(value):
+    """
+    Canonicaliza el hashtag sin almacenar el símbolo #.
+
+    - minúsculas
+    - elimina diacríticos (música -> musica)
+    - conserva letras/números Unicode (incluido japonés)
+    - separadores/puntuación -> guion
+    """
+    text = str(value or "").strip().lstrip("#")
+
+    if not text:
+        return ""
+
+    text = unicodedata.normalize(
+        "NFKD",
+        text,
+    )
+
+    pieces = []
+    separator = False
+
+    for char in text:
+        if unicodedata.combining(char):
+            continue
+
+        if char.isalnum():
+            if separator and pieces and pieces[-1] != "-":
+                pieces.append("-")
+
+            pieces.append(char.lower())
+            separator = False
+        else:
+            separator = True
+
+    result = "".join(pieces).strip("-")
+
+    # Evitar tags desproporcionados o dañados.
+    return result[:64]
+
+
+def clean_hashtags(payload):
+    raw = payload.get(
+        "hashtags",
+        [],
+    )
+
+    if raw is None:
+        raw = []
+
+    if isinstance(raw, str):
+        raw = re.split(
+            r"[\s,;]+",
+            raw,
+        )
+
+    if not isinstance(raw, list):
+        fail(
+            "Hashtags inválidos.",
+            14,
+        )
+
+    result = []
+    seen = set()
+
+    for item in raw:
+        tag = normalize_hashtag(
+            item
+        )
+
+        if not tag or tag in seen:
+            continue
+
+        seen.add(tag)
+        result.append(tag)
+
+        if len(result) > 50:
+            fail(
+                "Máximo 50 hashtags por canción.",
+                15,
+            )
+
+    return result
+
+
+def write_castillo_hashtags(path, hashtags):
+    value = ";".join(hashtags)
+
+    try:
+        raw = File(
+            path,
+            easy=False,
+        )
+    except Exception as error:
+        fail(
+            f"No fue posible abrir los hashtags: {error}",
+            25,
+        )
+
+    if raw is None:
+        fail(
+            "Formato no soportado para hashtags.",
+            26,
+        )
+
+    if raw.tags is None:
+        try:
+            raw.add_tags()
+        except Exception as error:
+            fail(
+                f"No fue posible crear metadata para hashtags: {error}",
+                27,
+            )
+
+    tags_obj = raw.tags
+
+    try:
+        if isinstance(tags_obj, ID3):
+            # MP3/ID3: TXXX:CASTILLO_HASHTAGS
+            for key in list(tags_obj.keys()):
+                if (
+                    key.startswith("TXXX:")
+                    and key[5:].casefold()
+                    == CASTILLO_HASHTAGS_KEY.casefold()
+                ):
+                    del tags_obj[key]
+
+            if value:
+                tags_obj.add(
+                    TXXX(
+                        encoding=3,
+                        desc=CASTILLO_HASHTAGS_KEY,
+                        text=[value],
+                    )
+                )
+
+        elif isinstance(tags_obj, MP4Tags):
+            # M4A/MP4: freeform com.apple.iTunes
+            tags_obj.pop(
+                MP4_HASHTAGS_KEY,
+                None,
+            )
+
+            if value:
+                tags_obj[MP4_HASHTAGS_KEY] = [
+                    MP4FreeForm(
+                        value.encode("utf-8"),
+                        dataformat=AtomDataType.UTF8,
+                    )
+                ]
+
+        else:
+            # FLAC / OGG / OPUS: Vorbis comments.
+            for key in list(tags_obj.keys()):
+                if (
+                    str(key).casefold()
+                    == CASTILLO_HASHTAGS_KEY.casefold()
+                ):
+                    del tags_obj[key]
+
+            if value:
+                tags_obj[CASTILLO_HASHTAGS_KEY] = [
+                    value
+                ]
+
+        raw.save()
+
+    except Exception as error:
+        fail(
+            f"No fue posible guardar CASTILLO_HASHTAGS: {error}",
+            28,
+        )
+
+
+def update_hashtags_index(audio):
+    """
+    Mantiene sincronizado el índice reconstruible de hashtags
+    después de cualquier edición de tags.
+
+    El archivo de audio sigue siendo la fuente de verdad.
+    Un fallo del índice NO revierte ni invalida el guardado
+    ya realizado en el archivo.
+    """
+    if not os.path.isfile(
+        HASHTAGS_INDEX
+    ):
+        return {
+            "ok": False,
+            "error":
+                "No existe castillo-hashtags-index.",
+        }
+
+    try:
+        process = subprocess.run(
+            [
+                HASHTAGS_INDEX,
+                "--update-audio",
+                audio,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error":
+                f"No fue posible actualizar el índice: {error}",
+        }
+
+    stdout = (
+        process.stdout
+        or ""
+    ).strip()
+
+    stderr = (
+        process.stderr
+        or ""
+    ).strip()
+
+    if process.returncode != 0:
+        message = stderr
+
+        try:
+            payload = json.loads(
+                stderr
+            )
+
+            if isinstance(
+                payload,
+                dict,
+            ):
+                message = str(
+                    payload.get(
+                        "error",
+                        message,
+                    )
+                )
+
+        except Exception:
+            pass
+
+        return {
+            "ok": False,
+            "error":
+                message
+                or (
+                    "castillo-hashtags-index "
+                    f"terminó con código {process.returncode}."
+                ),
+        }
+
+    try:
+        payload = json.loads(
+            stdout
+            or "{}"
+        )
+
+    except Exception as error:
+        return {
+            "ok": False,
+            "error":
+                "Respuesta inválida del índice: "
+                f"{error}",
+        }
+
+    if (
+        not isinstance(
+            payload,
+            dict,
+        )
+        or not payload.get(
+            "ok"
+        )
+    ):
+        return {
+            "ok": False,
+            "error":
+                str(
+                    payload.get(
+                        "error",
+                        "El índice no confirmó la actualización.",
+                    )
+                )
+                if isinstance(
+                    payload,
+                    dict,
+                )
+                else "Respuesta inválida del índice.",
+        }
+
+    return {
+        "ok": True,
+        "updated":
+            payload.get(
+                "updated",
+                "",
+            ),
+        "hashtags":
+            payload.get(
+                "hashtags",
+                [],
+            ),
+        "stats":
+            payload.get(
+                "stats",
+                {},
+            ),
+    }
+
+
+ROOT, HASHTAGS_INDEX = load_castillo_paths()
+
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--audio",
+    required=True,
+)
+
+args = parser.parse_args()
+
+
+audio = os.path.realpath(
+    args.audio
+)
+
+
+if (
+    not os.path.isfile(audio)
+    or audio == ROOT
+    or not path_inside_root(
+        audio,
+        ROOT,
+    )
+):
+    fail(
+        "Archivo de audio no autorizado.",
+        10,
+    )
+
+
+try:
+    payload = json.load(
+        sys.stdin
+    )
+
+except Exception:
+    fail(
+        "JSON inválido.",
+        11,
+    )
+
+
+if not isinstance(
+    payload,
+    dict,
+):
+    fail(
+        "Datos inválidos.",
+        12,
+    )
+
+
+tracknumber = clean_value(
+    payload,
+    "tracknumber",
+    100,
+)
+
+tracktotal = clean_value(
+    payload,
+    "tracktotal",
+    100,
+)
+
+discnumber = clean_value(
+    payload,
+    "discnumber",
+    100,
+)
+
+disctotal = clean_value(
+    payload,
+    "disctotal",
+    100,
+)
+
+hashtags = clean_hashtags(
+    payload
+)
+
+
+tags = {
+    "title": clean_value(payload, "title"),
+    "artist": clean_value(payload, "artist"),
+    "album": clean_value(payload, "album"),
+    "albumartist": clean_value(payload, "albumartist"),
+    "date": clean_value(payload, "date", 100),
+    "tracknumber": combine_number(
+        tracknumber,
+        tracktotal,
+    ),
+    "discnumber": combine_number(
+        discnumber,
+        disctotal,
+    ),
+    "genre": clean_value(payload, "genre"),
+    "composer": clean_value(payload, "composer"),
+    "comment": clean_value(payload, "comment", 10000),
+    "bpm": clean_value(payload, "bpm", 100),
+}
+
+
+#
+# Limpiar ID3v2 duplicados consecutivos
+# antes de abrir el archivo con Mutagen.
+#
+id3_cleanup = clean_duplicate_id3(
+    audio
+)
+
+
+try:
+    audio_file = File(
+        audio,
+        easy=True,
+    )
+
+except Exception as error:
+    fail(
+        f"No fue posible abrir el archivo: {error}",
+        20,
+    )
+
+
+if audio_file is None:
+    fail(
+        "Formato de audio no soportado.",
+        21,
+    )
+
+
+if audio_file.tags is None:
+    try:
+        audio_file.add_tags()
+
+    except Exception as error:
+        fail(
+            f"No fue posible crear los tags: {error}",
+            22,
+        )
+
+
+for key, value in tags.items():
+    try:
+        if value:
+            audio_file[key] = [
+                value
+            ]
+
+        else:
+            try:
+                del audio_file[key]
+            except KeyError:
+                pass
+
+    except Exception as error:
+        fail(
+            f"No fue posible modificar {key}: {error}",
+            23,
+        )
+
+
+try:
+    audio_file.save()
+
+except Exception as error:
+    fail(
+        f"No fue posible guardar los tags: {error}",
+        24,
+    )
+
+
+#
+# Guardar hashtags portables dentro del propio audio.
+#
+write_castillo_hashtags(
+    audio,
+    hashtags,
+)
+
+
+#
+# Fase 2C:
+# Actualizar automáticamente el índice SQLite después de
+# guardar los tags. También mantiene título/artista/álbum
+# del índice alineados con el archivo real.
+#
+hashtags_index_update = update_hashtags_index(
+    audio
+)
+
+
+print(
+    json.dumps(
+        {
+            "ok": True,
+
+            "file":
+                audio,
+
+            "tags": {
+                "title": tags["title"],
+                "artist": tags["artist"],
+                "album": tags["album"],
+                "albumartist": tags["albumartist"],
+                "date": tags["date"],
+                "tracknumber": tracknumber,
+                "tracktotal": tracktotal,
+                "discnumber": discnumber,
+                "disctotal": disctotal,
+                "genre": tags["genre"],
+                "composer": tags["composer"],
+                "comment": tags["comment"],
+                "bpm": tags["bpm"],
+                "hashtags": hashtags,
+            },
+
+            "hashtags_index":
+                hashtags_index_update,
+
+            "id3_cleanup": {
+                "cleaned":
+                    id3_cleanup[
+                        "cleaned"
+                    ],
+
+                "duplicates_removed":
+                    id3_cleanup[
+                        "duplicates"
+                    ],
+
+                "bytes_removed":
+                    id3_cleanup[
+                        "bytes_removed"
+                    ],
+            },
+        },
+        ensure_ascii=False,
+    )
+)

@@ -1,0 +1,11 @@
+[Unit]
+Description=Castillo Player NAS synchronization check
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1d
+AccuracySec=15min
+Unit=nas-music-sync.service
+
+[Install]
+WantedBy=timers.target

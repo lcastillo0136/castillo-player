@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+
+import argparse
+import configparser
+import hashlib
+import json
+import os
+import sys
+import tempfile
+
+
+CONFIG_FILE = "/etc/castillo-player/castillo.ini"
+
+MAX_SIZE = 2 * 1024 * 1024
+
+
+def fail(message, code):
+    print(
+        json.dumps(
+            {
+                "ok": False,
+                "error": message,
+            },
+            ensure_ascii=False,
+        ),
+        file=sys.stderr,
+    )
+
+    sys.exit(code)
+
+
+def clean_ini_value(value):
+    value = str(
+        value
+    ).strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == value[-1]
+        and value[0] in ('"', "'")
+    ):
+        value = value[1:-1].strip()
+
+    return value
+
+
+def validate_config_file():
+    if not os.path.isfile(
+        CONFIG_FILE
+    ):
+        fail(
+            "No existe la configuración de Castillo Player.",
+            2,
+        )
+
+    try:
+        stat_info = os.stat(
+            CONFIG_FILE
+        )
+
+    except OSError as error:
+        fail(
+            f"No fue posible revisar la configuración: {error}",
+            2,
+        )
+
+    if stat_info.st_uid != 0:
+        fail(
+            "La configuración de Castillo Player debe pertenecer a root.",
+            2,
+        )
+
+    if stat_info.st_mode & 0o022:
+        fail(
+            "La configuración de Castillo Player no puede ser escribible "
+            "por grupo u otros usuarios.",
+            2,
+        )
+
+
+def load_library_root():
+    validate_config_file()
+
+    parser = configparser.ConfigParser(
+        interpolation=None
+    )
+
+    try:
+        loaded = parser.read(
+            CONFIG_FILE,
+            encoding="utf-8",
+        )
+
+    except (
+        configparser.Error,
+        OSError,
+    ) as error:
+        fail(
+            f"No fue posible leer la configuración: {error}",
+            3,
+        )
+
+    if not loaded:
+        fail(
+            "No fue posible cargar la configuración de Castillo Player.",
+            3,
+        )
+
+    try:
+        root = clean_ini_value(
+            parser["core"]["library_root"]
+        )
+
+    except KeyError as error:
+        fail(
+            f"Falta configuración requerida: {error}",
+            4,
+        )
+
+    if (
+        not root
+        or not os.path.isabs(
+            root
+        )
+    ):
+        fail(
+            "library_root debe ser una ruta absoluta.",
+            5,
+        )
+
+    root = os.path.realpath(
+        root
+    )
+
+    if root == os.path.sep:
+        fail(
+            "library_root no puede ser la raíz del sistema.",
+            5,
+        )
+
+    if not os.path.isdir(
+        root
+    ):
+        fail(
+            "No existe la biblioteca local configurada.",
+            6,
+        )
+
+    return root
+
+
+def path_inside_root(
+    path,
+    root,
+):
+    try:
+        return (
+            os.path.commonpath(
+                [
+                    path,
+                    root,
+                ]
+            )
+            == root
+        )
+
+    except ValueError:
+        return False
+
+
+ROOT = load_library_root()
+
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument(
+    "--audio",
+    required=True
+)
+
+parser.add_argument(
+    "--expected-mtime",
+    type=int,
+    required=True
+)
+
+parser.add_argument(
+    "--expected-size",
+    type=int,
+    required=True
+)
+
+args = parser.parse_args()
+
+
+audio = os.path.realpath(
+    args.audio
+)
+
+
+if (
+    audio == ROOT
+    or not path_inside_root(
+        audio,
+        ROOT,
+    )
+    or not os.path.isfile(
+        audio
+    )
+):
+    fail(
+        "Archivo de audio no autorizado.",
+        10
+    )
+
+
+base, _ = os.path.splitext(
+    audio
+)
+
+target = base + ".lrc"
+
+
+if not path_inside_root(
+    os.path.realpath(
+        os.path.dirname(
+            target
+        )
+    ),
+    ROOT,
+):
+    fail(
+        "Ruta LRC no autorizada.",
+        11,
+    )
+
+
+#
+# Comprobación de conflicto.
+#
+exists = os.path.isfile(
+    target
+)
+
+
+if exists:
+    stat = os.stat(
+        target
+    )
+
+    current_mtime = int(
+        stat.st_mtime
+    )
+
+    current_size = int(
+        stat.st_size
+    )
+
+else:
+    current_mtime = -1
+    current_size = -1
+
+
+if (
+    current_mtime
+    != args.expected_mtime
+    or current_size
+    != args.expected_size
+):
+    fail(
+        "El archivo LRC cambió desde que fue abierto.",
+        23
+    )
+
+
+data = sys.stdin.buffer.read(
+    MAX_SIZE + 1
+)
+
+
+if len(data) > MAX_SIZE:
+    fail(
+        "El archivo LRC es demasiado grande.",
+        24
+    )
+
+
+try:
+    data.decode(
+        "utf-8"
+    )
+
+except UnicodeDecodeError:
+    fail(
+        "El contenido no es UTF-8 válido.",
+        25
+    )
+
+
+directory = os.path.dirname(
+    target
+)
+
+
+#
+# Preservar propietario/permisos.
+#
+if exists:
+    existing_stat = os.stat(
+        target
+    )
+
+    uid = existing_stat.st_uid
+    gid = existing_stat.st_gid
+
+    mode = (
+        existing_stat.st_mode
+        & 0o777
+    )
+
+else:
+    audio_stat = os.stat(
+        audio
+    )
+
+    uid = audio_stat.st_uid
+    gid = audio_stat.st_gid
+    mode = 0o664
+
+
+fd, temporary = tempfile.mkstemp(
+    prefix=".castillo-lrc-",
+    suffix=".tmp",
+    dir=directory
+)
+
+
+try:
+    with os.fdopen(
+        fd,
+        "wb"
+    ) as handle:
+
+        handle.write(
+            data
+        )
+
+        handle.flush()
+
+        os.fsync(
+            handle.fileno()
+        )
+
+
+    os.chown(
+        temporary,
+        uid,
+        gid
+    )
+
+    os.chmod(
+        temporary,
+        mode
+    )
+
+
+    #
+    # Sustitución atómica.
+    #
+    os.replace(
+        temporary,
+        target
+    )
+
+
+    dir_fd = os.open(
+        directory,
+        os.O_RDONLY
+    )
+
+    try:
+        os.fsync(
+            dir_fd
+        )
+
+    finally:
+        os.close(
+            dir_fd
+        )
+
+
+finally:
+    if os.path.exists(
+        temporary
+    ):
+        os.unlink(
+            temporary
+        )
+
+
+stat = os.stat(
+    target
+)
+
+
+print(
+    json.dumps(
+        {
+            "ok": True,
+            "file": target,
+            "size": stat.st_size,
+            "mtime": int(
+                stat.st_mtime
+            ),
+            "sha256":
+                hashlib.sha256(
+                    data
+                ).hexdigest(),
+        },
+        ensure_ascii=False,
+    )
+)
