@@ -41,9 +41,11 @@ const STORAGE_KEY =
 
 const collapsed = ref(false)
 const nasSync = ref(null)
+const usbStorage = ref(null)
 const clockTick = ref(0)
 
 let nasTimer = null
+let storageTimer = null
 
 const items = [
   {
@@ -148,6 +150,78 @@ async function loadNasSyncStatus() {
       ok: false
     }
   }
+}
+
+async function loadUsbStorage() {
+  try {
+    const response =
+      await fetch(
+        '/castillo-api/storage.php',
+        {
+          cache: 'no-store'
+        }
+      )
+
+
+    const data =
+      await response.json()
+
+
+    if (!response.ok) {
+      throw new Error(
+        data.error ||
+        'No fue posible leer el almacenamiento.'
+      )
+    }
+
+
+    usbStorage.value =
+      data
+
+
+  } catch {
+    usbStorage.value = {
+      ok: false
+    }
+  }
+}
+
+
+function formatStorageSize(
+  bytes
+) {
+  const value =
+    Number(bytes)
+
+
+  if (
+    !Number.isFinite(value) ||
+    value < 0
+  ) {
+    return '—'
+  }
+
+
+  const gib =
+    value /
+    (
+      1024 *
+      1024 *
+      1024
+    )
+
+
+  if (gib >= 1024) {
+    return (
+      gib / 1024
+    ).toFixed(1) + ' TB'
+  }
+
+
+  return (
+    gib.toFixed(1) +
+    ' GB'
+  )
 }
 
 function formatRemaining() {
@@ -289,6 +363,24 @@ onBeforeUnmount(() => {
   if (nasTimer) {
     window.clearInterval(
       nasTimer
+    )
+  }
+})
+onMounted(() => {
+  loadUsbStorage()
+
+  storageTimer =
+    window.setInterval(
+      loadUsbStorage,
+      60000
+    )
+})
+
+
+onBeforeUnmount(() => {
+  if (storageTimer) {
+    window.clearInterval(
+      storageTimer
     )
   }
 })
@@ -496,7 +588,7 @@ onBeforeUnmount(() => {
       :class="
         collapsed
           ? ''
-          : 'px-3'
+          : ''
       "
     >
       <button
@@ -612,6 +704,101 @@ onBeforeUnmount(() => {
           Castillo Player
         </p>
 
+        <!-- USB STORAGE -->
+        <div
+          v-if="usbStorage?.ok"
+          class="mt-3"
+        >
+          <div
+            class="text-[10px]
+                   text-white/45"
+          >
+            <div
+              class="flex
+                     items-center
+                     justify-between
+                     gap-2"
+            >
+              <span>
+                Almacenamiento
+              </span>
+
+              <span
+                class="text-right
+                       text-[11px]
+                       font-medium
+                       leading-tight
+                       text-white/65"
+              >
+                {{
+                  formatStorageSize(
+                    usbStorage.used_bytes
+                  )
+                }}
+              </span>
+            </div>
+
+            <div
+              class="mt-0.5
+                     text-right
+                     text-[10px]
+                     leading-tight
+                     text-white/45"
+            >
+              de
+              {{
+                formatStorageSize(
+                  usbStorage.total_bytes
+                )
+              }}
+            </div>
+          </div>
+
+
+          <div
+            class="mt-2
+                   h-1.5
+                   overflow-hidden
+                   rounded-full
+                   bg-white/10"
+          >
+            <div
+              class="h-full
+                     rounded-full
+                     bg-emerald-400
+                     transition-all
+                     duration-500"
+              :style="{
+                width:
+                  `${usbStorage.used_percent}%`
+              }"
+            />
+          </div>
+
+
+          <div
+            class="mt-1.5
+                   flex
+                   items-center
+                   justify-between
+                   text-[9px]
+                   text-white/35"
+          >
+            <span>
+              {{ usbStorage.used_percent }}%
+              usado
+            </span>
+
+            <span>
+              {{
+                formatStorageSize(
+                  usbStorage.free_bytes
+                )
+              }}
+              libres
+            </span>
+          </div>
+        </div>
 
         <!-- DIVIDER -->
         <div
