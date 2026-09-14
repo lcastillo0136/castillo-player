@@ -129,6 +129,117 @@ function runCommand(
     ];
 }
 
+function mpdOutputsState(): array
+{
+    $result =
+        runCommand([
+            '/usr/bin/mpc',
+            'outputs'
+        ]);
+
+
+    if ($result['code'] !== 0) {
+        return [];
+    }
+
+
+    $outputs = [];
+
+
+    foreach (
+        preg_split(
+            '/\r?\n/',
+            $result['stdout']
+        )
+        as $line
+    ) {
+        if (
+            !preg_match(
+                '/^Output\s+(\d+)\s+\((.+?)\)\s+is\s+(enabled|disabled)$/i',
+                trim($line),
+                $match
+            )
+        ) {
+            continue;
+        }
+
+
+        $outputs[] = [
+            'id' =>
+                (int) $match[1],
+
+            'name' =>
+                trim($match[2]),
+
+            'enabled' =>
+                strcasecmp(
+                    $match[3],
+                    'enabled'
+                ) === 0
+        ];
+    }
+
+
+    return $outputs;
+}
+
+
+function findMpdOutput(
+    array $outputs,
+    string $name
+): ?array {
+    foreach ($outputs as $output) {
+        if (
+            strcasecmp(
+                (string) (
+                    $output['name']
+                    ?? ''
+                ),
+                $name
+            ) === 0
+        ) {
+            return $output;
+        }
+    }
+
+
+    return null;
+}
+
+
+function setMpdOutputEnabled(
+    string $name,
+    bool $enabled
+): array {
+    $output =
+        findMpdOutput(
+            mpdOutputsState(),
+            $name
+        );
+
+
+    if ($output === null) {
+        return [
+            'code' => 1,
+            'stdout' => '',
+            'stderr' =>
+                'No se encontró la salida MPD: ' .
+                $name
+        ];
+    }
+
+
+    return runCommand([
+        '/usr/bin/mpc',
+
+        $enabled
+            ? 'enable'
+            : 'disable',
+
+        (string) $output['id']
+    ]);
+}
+
 function runAudioOutputHelper(
     array $arguments
 ): array {
@@ -385,7 +496,6 @@ function getMoodeOutput(): string
     return $output;
 }
 
-
 function getBluetoothMac(): string
 {
     $file =
@@ -418,7 +528,6 @@ function getBluetoothMac(): string
     return '';
 }
 
-
 function bluetoothInfo(
     string $mac
 ): string {
@@ -435,7 +544,6 @@ function bluetoothInfo(
 
     return $result['stdout'];
 }
-
 
 function pairedAudioSinks(): array
 {
@@ -549,7 +657,6 @@ function pairedAudioSinks(): array
     return $devices;
 }
 
-
 function outputState(): array
 {
     $mode =
@@ -557,6 +664,29 @@ function outputState(): array
 
     $bluetoothMac =
         getBluetoothMac();
+
+
+    $mpdOutputs =
+        mpdOutputsState();
+
+
+    $localMpdOutput =
+        findMpdOutput(
+            $mpdOutputs,
+            'ALSA Default'
+        );
+
+    $bluetoothMpdOutput =
+        findMpdOutput(
+            $mpdOutputs,
+            'ALSA Bluetooth'
+        );
+
+    $httpMpdOutput =
+        findMpdOutput(
+            $mpdOutputs,
+            'HTTP Server'
+        );
 
 
     $outputs = [
@@ -579,6 +709,35 @@ function outputState(): array
     ];
 
 
+    /*
+     * Salida HTTP de MPD.
+     *
+     * El audio será reproducido por el
+     * navegador del dispositivo actual.
+     */
+    if ($httpMpdOutput !== null) {
+        $outputs[] = [
+            'id' =>
+                'browser',
+
+            'type' =>
+                'browser',
+
+            'mac' =>
+                null,
+
+            'name' =>
+                'Este dispositivo',
+
+            'connected' =>
+                true,
+
+            'port' =>
+                8000
+        ];
+    }
+
+
     foreach (
         pairedAudioSinks()
         as $device
@@ -588,16 +747,47 @@ function outputState(): array
     }
 
 
-    if (
-        strcasecmp(
-            $mode,
-            'Bluetooth'
-        ) === 0 &&
+    $browserSelected =
+        (
+            $httpMpdOutput['enabled']
+            ?? false
+        ) &&
+        !(
+            $localMpdOutput['enabled']
+            ?? false
+        ) &&
+        !(
+            $bluetoothMpdOutput['enabled']
+            ?? false
+        );
+
+
+    $bluetoothSelected =
+        $bluetoothMpdOutput !== null
+            ? (
+                $bluetoothMpdOutput['enabled']
+                ?? false
+            )
+            : (
+                strcasecmp(
+                    $mode,
+                    'Bluetooth'
+                ) === 0
+            );
+
+
+    if ($browserSelected) {
+        $selected =
+            'browser';
+
+    } elseif (
+        $bluetoothSelected &&
         $bluetoothMac !== ''
     ) {
         $selected =
             'bluetooth:' .
             $bluetoothMac;
+
     } else {
         $selected =
             'local';
@@ -617,7 +807,6 @@ function outputState(): array
             $outputs
     ];
 }
-
 
 $method =
     strtoupper(
@@ -675,11 +864,59 @@ $type =
 $mpdStateBefore =
     captureMpdState();
 
+/*
+ * BROWSER / ESTE DISPOSITIVO
+ */
+if ($type === 'browser') {
+
+    /*
+     * Primero habilitamos HTTP para evitar
+     * un instante sin ninguna salida.
+     */
+    $result =
+        setMpdOutputEnabled(
+            'HTTP Server',
+            true
+        );
+
+
+    if ($result['code'] !== 0) {
+        respond([
+            'error' =>
+                $result['stderr']
+                ?: $result['stdout']
+                ?: 'No fue posible habilitar el stream HTTP.'
+        ], 500);
+    }
+
+
+    /*
+     * HTTP queda como salida exclusiva.
+     */
+    setMpdOutputEnabled(
+        'ALSA Default',
+        false
+    );
+
+    setMpdOutputEnabled(
+        'ALSA Bluetooth',
+        false
+    );
+
+
+    respond(
+        outputState()
+    );
+}
 
 /*
  * LOCAL
  */
 if ($type === 'local') {
+    setMpdOutputEnabled(
+        'HTTP Server',
+        false
+    );
 
     $result =
         runAudioOutputHelper([
@@ -718,7 +955,11 @@ if ($type === 'local') {
  * BLUETOOTH
  */
 if ($type === 'bluetooth') {
-
+    setMpdOutputEnabled(
+        'HTTP Server',
+        false
+    );
+    
     $mac =
         strtoupper(
             trim(

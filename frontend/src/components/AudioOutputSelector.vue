@@ -10,6 +10,7 @@ import {
   ChevronDown,
   Headphones,
   LoaderCircle,
+  MonitorSpeaker,
   Music2,
   Speaker
 } from 'lucide-vue-next'
@@ -54,7 +55,9 @@ async function selectOutput(
 ) {
   if (
     output.id ===
-    currentOutput.value?.id
+    currentOutput.value?.id &&
+    output.type !==
+    'browser'
   ) {
     opened.value = false
     return
@@ -147,6 +150,16 @@ onBeforeUnmount(() => {
         v-else-if="
           currentOutput?.type ===
           'local'
+        "
+        class="h-5 w-5
+               shrink-0
+               text-[#ff6470]"
+      />
+
+      <MonitorSpeaker
+        v-else-if="
+          currentOutput?.type ===
+          'browser'
         "
         class="h-5 w-5
                shrink-0
@@ -274,6 +287,14 @@ onBeforeUnmount(() => {
             class="h-5 w-5"
           />
 
+          <MonitorSpeaker
+            v-else-if="
+              output.type ===
+              'browser'
+            "
+            class="h-5 w-5"
+          />
+
           <Speaker
             v-else
             class="h-5 w-5"
@@ -305,6 +326,15 @@ onBeforeUnmount(() => {
               "
             >
               Salida local
+            </template>
+
+            <template
+              v-else-if="
+                output.type ===
+                'browser'
+              "
+            >
+              Navegador actual
             </template>
 
             <template v-else>
