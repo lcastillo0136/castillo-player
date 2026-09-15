@@ -29,6 +29,9 @@ import WaveformProgress
 import AudioOutputSelector
   from '../components/AudioOutputSelector.vue'
 
+import CastilloVuMeter
+  from '../components/CastilloVuMeter.vue'
+
 import {
   useCastilloApi
 } from '../composables/useCastilloApi'
@@ -739,6 +742,7 @@ function openCurrentAlbum() {
         />
       </button>
     </section>
+    
     <!-- AUDIO OUTPUT -->
     <div
       class="mt-6
@@ -747,6 +751,18 @@ function openCurrentAlbum() {
     >
       <AudioOutputSelector />
     </div>
+
+
+    <!-- VU METER -->
+    <div
+      class="mt-6
+             w-full"
+    >
+      <CastilloVuMeter />
+    </div>
+
+
+    <!-- SWIPE TO LYRICS -->
 
     <!-- SWIPE TO LYRICS -->
     <div

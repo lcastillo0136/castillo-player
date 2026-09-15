@@ -747,19 +747,18 @@ function outputState(): array
     }
 
 
-    $browserSelected =
-        (
-            $httpMpdOutput['enabled']
-            ?? false
-        ) &&
-        !(
-            $localMpdOutput['enabled']
-            ?? false
-        ) &&
-        !(
-            $bluetoothMpdOutput['enabled']
-            ?? false
-        );
+    $localSelected =
+        $localMpdOutput !== null
+            ? (
+                $localMpdOutput['enabled']
+                ?? false
+            )
+            : (
+                strcasecmp(
+                    $mode,
+                    'Local'
+                ) === 0
+            );
 
 
     $bluetoothSelected =
@@ -776,6 +775,15 @@ function outputState(): array
             );
 
 
+    $browserSelected =
+        (
+            $httpMpdOutput['enabled']
+            ?? false
+        ) &&
+        !$localSelected &&
+        !$bluetoothSelected;
+
+
     if ($browserSelected) {
         $selected =
             'browser';
@@ -788,9 +796,13 @@ function outputState(): array
             'bluetooth:' .
             $bluetoothMac;
 
-    } else {
+    } elseif ($localSelected) {
         $selected =
             'local';
+
+    } else {
+        $selected =
+            'none';
     }
 
 
@@ -865,6 +877,76 @@ $mpdStateBefore =
     captureMpdState();
 
 /*
+ * ANALYSIS STREAM
+ *
+ * Habilita el HTTP Server de MPD en paralelo
+ * con la salida actual para que el navegador
+ * pueda analizar el audio sin cambiar de salida.
+ */
+if ($type === 'analysis') {
+
+    $enabled =
+        (bool) (
+            $data['enabled']
+            ?? false
+        );
+
+
+    if ($enabled) {
+
+        $result =
+            setMpdOutputEnabled(
+                'HTTP Server',
+                true
+            );
+
+
+        if ($result['code'] !== 0) {
+            respond([
+                'error' =>
+                    $result['stderr']
+                    ?: $result['stdout']
+                    ?: 'No fue posible habilitar el stream de análisis.'
+            ], 500);
+        }
+
+
+        respond([
+            'ok' => true,
+            'analysis' => true,
+            'state' => outputState()
+        ]);
+    }
+
+
+    /*
+     * Si "Este dispositivo" es la salida
+     * seleccionada, HTTP Server es necesario
+     * para escuchar y no debemos apagarlo.
+     */
+    $state =
+        outputState();
+
+
+    if (
+        ($state['selected'] ?? '')
+        !== 'browser'
+    ) {
+        setMpdOutputEnabled(
+            'HTTP Server',
+            false
+        );
+    }
+
+
+    respond([
+        'ok' => true,
+        'analysis' => false,
+        'state' => outputState()
+    ]);
+}
+
+/*
  * BROWSER / ESTE DISPOSITIVO
  */
 if ($type === 'browser') {
@@ -913,15 +995,17 @@ if ($type === 'browser') {
  * LOCAL
  */
 if ($type === 'local') {
-    setMpdOutputEnabled(
-        'HTTP Server',
-        false
-    );
 
+    /*
+     * Dejamos HTTP activo mientras moOde
+     * realiza el cambio para no quedarnos
+     * momentáneamente sin ninguna salida.
+     */
     $result =
         runAudioOutputHelper([
             'local'
         ]);
+
 
     if ($result['code'] !== 0) {
         respond([
@@ -934,12 +1018,61 @@ if ($type === 'local') {
 
 
     /*
-     * set-btaudio reinicia MPD.
-     * Esperamos a que vuelva.
+     * set-btaudio puede reiniciar MPD.
      */
     waitForMpd();
 
 
+    /*
+     * Importante:
+     *
+     * Browser deshabilita ALSA Default
+     * directamente mediante MPD.
+     *
+     * moOde puede seguir considerando que
+     * la salida configurada ya es Local y
+     * no volver a habilitar Output 1.
+     *
+     * Por eso lo aseguramos explícitamente.
+     */
+    $localResult =
+        setMpdOutputEnabled(
+            'ALSA Default',
+            true
+        );
+
+
+    if ($localResult['code'] !== 0) {
+        respond([
+            'error' =>
+                $localResult['stderr']
+                ?: $localResult['stdout']
+                ?: 'No fue posible habilitar DAC HiFi.'
+        ], 500);
+    }
+
+
+    /*
+     * DAC queda como salida exclusiva.
+     *
+     * Primero habilitamos Local y solo
+     * después retiramos las otras salidas.
+     */
+    setMpdOutputEnabled(
+        'ALSA Bluetooth',
+        false
+    );
+
+    setMpdOutputEnabled(
+        'HTTP Server',
+        false
+    );
+
+
+    /*
+     * Recuperamos reproducción / pausa
+     * y posición anteriores.
+     */
     restoreMpdState(
         $mpdStateBefore
     );
