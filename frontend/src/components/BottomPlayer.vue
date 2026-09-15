@@ -6,7 +6,6 @@ import {
 } from 'vue'
 
 import {
-  Activity,
   Pause,
   Play,
   Repeat2,
@@ -22,9 +21,6 @@ import WaveformProgress
 
 import AudioOutputSelector
   from './AudioOutputSelector.vue'
-
-import CastilloVuMeter
-  from './CastilloVuMeter.vue'
 
 import {
   useCastilloApi
@@ -60,7 +56,6 @@ const {
 
 const localVolume = ref(0)
 const previousVolume = ref(50)
-const vuOpen = ref(false)
 
 watch(
   volume,
@@ -383,63 +378,13 @@ async function toggleMute() {
       </div>
 
       <div
-        class="relative
-               flex w-[360px]
+        class="flex w-[360px]
                items-center
                justify-end
                gap-3"
       >
-        <!-- VU PANEL -->
-        <div
-          v-if="vuOpen"
-          class="absolute
-                 bottom-[calc(100%+18px)]
-                 right-0
-                 z-[100]
-                 w-[420px]
-                 max-w-[calc(100vw-32px)]
-                 overflow-hidden
-                 rounded-[20px]
-                 bg-[#f7f7f5]
-                 shadow-[0_18px_55px_rgba(0,0,0,0.16)]"
-        >
-          <CastilloVuMeter />
-        </div>
-
-
         <AudioOutputSelector />
-
-
-        <!-- VU TOGGLE -->
-        <button
-          type="button"
-          class="flex
-                 h-9
-                 w-9
-                 shrink-0
-                 items-center
-                 justify-center
-                 rounded-full
-                 transition-colors"
-          :class="
-            vuOpen
-              ? 'bg-[#ff6470]/10 text-[#ff6470]'
-              : 'text-black/45 hover:bg-black/[0.04] hover:text-black/70'
-          "
-          title="Visualizador"
-          aria-label="Mostrar visualizador"
-          :aria-pressed="vuOpen"
-          @click="
-            vuOpen = !vuOpen
-          "
-        >
-          <Activity
-            class="h-5 w-5"
-            :stroke-width="2"
-          />
-        </button>
-
-
+        
         <button
           class="text-black/45"
           @click="toggleMute"
